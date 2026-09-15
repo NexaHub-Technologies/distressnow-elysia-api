@@ -7,24 +7,24 @@
  *
  * All responses use the envelope { success, message, data }.
  *
- * Persistence: the foundation agent's drizzle schema (src/db/schema.ts) is
- * not present yet, so this module defines local TypeScript types plus an
- * in-memory UserStore behind a small interface. Swap MemoryUserStore for a
- * drizzle-backed implementation with the same interface when the schema
- * lands — no route code needs to change. Pass stores via plugin options
- * (see createAuthPlugin / createAuthGuard) to isolate tests.
+ * Persistence: stores implement small interfaces (UserStore / OtpStore below).
+ * The default plugins resolve DB-backed stores via getDbStores()
+ * (src/db/stores.ts) whenever DATABASE_URL is reachable and fall back to the
+ * in-memory singletons otherwise (one warning is logged on connect failure).
+ * Tests pass explicit in-memory stores through the plugin options, so route
+ * code never changes.
  *
  * JWT: @elysiajs/jwt, secret from JWT_SECRET env. Logout revokes the bearer
  * token in-memory (revokedTokens); use a denylist table once persistent.
  */
 import { Elysia, t, type AnyElysia } from 'elysia';
 import { jwt } from '@elysiajs/jwt';
+import { getDbStores } from '../../db/stores';
 import { isEmailIdentifier, newId, normalizeEmail, normalizePhone, nowIso } from '../../utils/phone';
 import {
   otpStore as defaultOtpStore,
   sendOtp as sendPhoneOtp,
   OtpError,
-  type MemoryOtpStore,
   type OtpType,
 } from '../../services/termii';
 import {
@@ -99,6 +99,27 @@ export interface UserStore {
   findByProvider(provider: string, providerId: string): Promise<AuthUser | null>;
   create(input: CreateUserInput): Promise<AuthUser>;
   update(id: string, patch: Partial<AuthUser>): Promise<AuthUser | null>;
+}
+
+/**
+ * OTP lifecycle, abstracted so a Postgres-backed implementation
+ * (src/db/stores.ts) can sit behind the same surface as MemoryOtpStore.
+ */
+export interface OtpStore {
+  /** Issue a code, invalidating any previous unused code for identifier + type. */
+  issue(
+    identifier: string,
+    type: OtpType,
+  ): Promise<{ code: string; expiresAt: number }>;
+  /** Single-use verify; @throws OtpError NOT_FOUND | EXPIRED | LOCKED | INVALID */
+  verify(
+    identifier: string,
+    code: string,
+    type: OtpType,
+    now?: number,
+  ): Promise<void>;
+  /** Test/dev helper: drop all stored codes. */
+  clear(): void;
 }
 
 export class MemoryUserStore implements UserStore {
@@ -418,12 +439,13 @@ const UpdateMeBody = t.Object({
 export interface AuthPluginOptions {
   secret?: string;
   users?: UserStore;
-  otp?: MemoryOtpStore;
+  otp?: OtpStore;
 }
 
 export function createAuthPlugin(options: AuthPluginOptions = {}) {
-  const users = options.users ?? userStore;
-  const otp = options.otp ?? defaultOtpStore;
+  const dbStores = getDbStores();
+  const users = options.users ?? dbStores?.users ?? userStore;
+  const otp = options.otp ?? dbStores?.otp ?? defaultOtpStore;
   const secret = options.secret ?? jwtSecret();
 
   async function signToken(authJwt: { sign: (p: Record<string, string>) => Promise<string> }, userId: string): Promise<string> {

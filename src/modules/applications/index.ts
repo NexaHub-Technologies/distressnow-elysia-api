@@ -11,10 +11,16 @@
  * Duplicate pending applications are rejected with 409, mirroring the reference.
  * File uploads (store logos / provider photos) are accepted as URL strings;
  * use src/services/storage.ts uploadBuffer() if binary upload is needed later.
+ *
+ * Persistence sits behind the SellerApplicationStore / ProviderApplicationStore
+ * interfaces: the default plugin uses Postgres-backed stores
+ * (src/db/stores.ts) while DATABASE_URL is reachable and falls back to the
+ * in-memory singletons otherwise (same pattern as the auth / kyc modules).
  */
 import { Elysia, t } from 'elysia';
 import { applyAuthGuard, createEnvelopeErrors, fail, ok, type UserStore } from '../auth/index';
-import { kycStore as defaultKycStore, type MemoryKycStore } from '../kyc/index';
+import { getDbStores } from '../../db/stores';
+import { kycStore as defaultKycStore, type KycStore } from '../kyc/index';
 import { newId, nowIso } from '../../utils/phone';
 
 export type ApplicationStatus = 'pending' | 'approved' | 'declined';
@@ -64,7 +70,24 @@ export interface ProviderApplication {
   created_at: string;
 }
 
-export class MemorySellerApplicationStore {
+/**
+ * Persistence surface for seller applications. Methods may be sync (memory)
+ * or async (Postgres) — callers always `await`, which works for both.
+ */
+export interface SellerApplicationStore {
+  create(
+    data: Omit<SellerApplication, 'id' | 'created_at'>,
+  ): SellerApplication | Promise<SellerApplication>;
+  latestByUser(
+    userId: string,
+  ): SellerApplication | null | Promise<SellerApplication | null>;
+  pendingByUser(
+    userId: string,
+  ): SellerApplication | null | Promise<SellerApplication | null>;
+  clear(): void;
+}
+
+export class MemorySellerApplicationStore implements SellerApplicationStore {
   private applications: SellerApplication[] = [];
 
   create(data: Omit<SellerApplication, 'id' | 'created_at'>): SellerApplication {
@@ -93,7 +116,24 @@ export class MemorySellerApplicationStore {
   }
 }
 
-export class MemoryProviderApplicationStore {
+/**
+ * Persistence surface for provider applications. Methods may be sync (memory)
+ * or async (Postgres) — callers always `await`, which works for both.
+ */
+export interface ProviderApplicationStore {
+  create(
+    data: Omit<ProviderApplication, 'id' | 'created_at'>,
+  ): ProviderApplication | Promise<ProviderApplication>;
+  latestByUser(
+    userId: string,
+  ): ProviderApplication | null | Promise<ProviderApplication | null>;
+  pendingByUser(
+    userId: string,
+  ): ProviderApplication | null | Promise<ProviderApplication | null>;
+  clear(): void;
+}
+
+export class MemoryProviderApplicationStore implements ProviderApplicationStore {
   private applications: ProviderApplication[] = [];
 
   create(data: Omit<ProviderApplication, 'id' | 'created_at'>): ProviderApplication {
@@ -168,26 +208,26 @@ const ProviderBody = t.Object({
 export interface ApplicationsPluginOptions {
   secret?: string;
   users?: UserStore;
-  kyc?: MemoryKycStore;
-  sellers?: MemorySellerApplicationStore;
-  providers?: MemoryProviderApplicationStore;
+  kyc?: KycStore;
+  sellers?: SellerApplicationStore;
+  providers?: ProviderApplicationStore;
 }
 
 export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}) {
-  const kyc = options.kyc ?? defaultKycStore;
-  const sellers = options.sellers ?? sellerApplications;
-  const providers = options.providers ?? providerApplications;
+  const kyc = options.kyc ?? getDbStores()?.kyc ?? defaultKycStore;
+  const sellers = options.sellers ?? getDbStores()?.sellers ?? sellerApplications;
+  const providers = options.providers ?? getDbStores()?.providers ?? providerApplications;
 
   return applyAuthGuard(new Elysia({ prefix: '/api/v1/applications' }), {
     secret: options.secret,
-    users: options.users,
+    users: options.users ?? getDbStores()?.users,
   })
     .use(createEnvelopeErrors())
 
-    .get('/seller/status', ({ currentUser, status }) => {
+    .get('/seller/status', async ({ currentUser, status }) => {
       if (!currentUser) return status(401, fail('Unauthenticated.'));
       return ok('Seller application status retrieved.', {
-        application: sellers.latestByUser(currentUser.id),
+        application: await sellers.latestByUser(currentUser.id),
       });
     })
 
@@ -195,11 +235,11 @@ export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}
       '/seller',
       async ({ body, currentUser, status }) => {
         if (!currentUser) return status(401, fail('Unauthenticated.'));
-        if (kyc.approvedTier(currentUser.id) < 2) {
+        if ((await kyc.approvedTier(currentUser.id)) < 2) {
           return status(403, fail('Approved Tier 2 KYC is required to apply as a seller.'));
         }
 
-        const pending = sellers.pendingByUser(currentUser.id);
+        const pending = await sellers.pendingByUser(currentUser.id);
         if (pending) {
           return status(409, {
             success: false as const,
@@ -208,7 +248,7 @@ export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}
           });
         }
 
-        const application = sellers.create({
+        const application = await sellers.create({
           userId: currentUser.id,
           status: 'pending',
           store_name: body.store_name,
@@ -239,10 +279,10 @@ export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}
       { body: SellerBody },
     )
 
-    .get('/provider/status', ({ currentUser, status }) => {
+    .get('/provider/status', async ({ currentUser, status }) => {
       if (!currentUser) return status(401, fail('Unauthenticated.'));
       return ok('Provider application status retrieved.', {
-        application: providers.latestByUser(currentUser.id),
+        application: await providers.latestByUser(currentUser.id),
       });
     })
 
@@ -250,11 +290,11 @@ export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}
       '/provider',
       async ({ body, currentUser, status }) => {
         if (!currentUser) return status(401, fail('Unauthenticated.'));
-        if (kyc.approvedTier(currentUser.id) < 1) {
+        if ((await kyc.approvedTier(currentUser.id)) < 1) {
           return status(403, fail('Approved Tier 1 KYC is required to apply as a provider.'));
         }
 
-        const pending = providers.pendingByUser(currentUser.id);
+        const pending = await providers.pendingByUser(currentUser.id);
         if (pending) {
           return status(409, {
             success: false as const,
@@ -263,7 +303,7 @@ export function createApplicationsPlugin(options: ApplicationsPluginOptions = {}
           });
         }
 
-        const application = providers.create({
+        const application = await providers.create({
           userId: currentUser.id,
           status: 'pending',
           full_name: body.full_name,

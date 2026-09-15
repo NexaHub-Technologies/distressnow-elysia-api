@@ -10,15 +10,18 @@
  *  - a rejected/pending KYC can be re-submitted
  *
  * Files upload via src/services/storage.ts uploadBuffer(); document URLs are
- * stored as JSON on the record. Persistence is an in-memory store behind a
- * small interface until the drizzle schema lands (same swap-out pattern as
- * the auth module).
+ * stored as JSON on the record. Persistence sits behind the small KycStore
+ * interface below: the default plugin uses a Postgres-backed store
+ * (src/db/stores.ts) while DATABASE_URL is reachable and falls back to the
+ * in-memory MemoryKycStore otherwise (same swap-out pattern as the auth
+ * module).
  *
  * Also exports approvedTier() / MemoryKycStore for the applications module's
  * kyc:1 / kyc:2 guards.
  */
 import { Elysia, t } from 'elysia';
 import { applyAuthGuard, createEnvelopeErrors, fail, ok, type UserStore } from '../auth/index';
+import { getDbStores } from '../../db/stores';
 import { uploadBuffer } from '../../services/storage';
 import { newId, nowIso } from '../../utils/phone';
 
@@ -66,7 +69,25 @@ export function serializeKyc(record: KycRecord): SerializedKyc {
   };
 }
 
-export class MemoryKycStore {
+/**
+ * Persistence surface for KYC records. Methods may be sync (memory) or
+ * async (Postgres) — callers always `await`, which works for both.
+ */
+export interface KycStore {
+  get(userId: string): KycRecord | null | Promise<KycRecord | null>;
+  upsert(record: KycRecord): KycRecord | Promise<KycRecord>;
+  /** Admin/test helper: force a review outcome. */
+  setStatus(
+    userId: string,
+    status: KycStatus,
+    reason?: string | null,
+  ): KycRecord | null | Promise<KycRecord | null>;
+  /** Approved tier, or 0 when there is no approved KYC. */
+  approvedTier(userId: string): number | Promise<number>;
+  clear(): void;
+}
+
+export class MemoryKycStore implements KycStore {
   private records = new Map<string, KycRecord>();
 
   get(userId: string): KycRecord | null {
@@ -142,21 +163,21 @@ function asFileArray(value: unknown): File[] {
 export interface KycPluginOptions {
   secret?: string;
   users?: UserStore;
-  kyc?: MemoryKycStore;
+  kyc?: KycStore;
 }
 
 export function createKycPlugin(options: KycPluginOptions = {}) {
-  const kyc = options.kyc ?? kycStore;
+  const kyc = options.kyc ?? getDbStores()?.kyc ?? kycStore;
 
   return applyAuthGuard(new Elysia({ prefix: '/api/v1/kyc' }), {
     secret: options.secret,
-    users: options.users,
+    users: options.users ?? getDbStores()?.users,
   })
     .use(createEnvelopeErrors())
 
-    .get('/status', ({ currentUser, status }) => {
+    .get('/status', async ({ currentUser, status }) => {
       if (!currentUser) return status(401, fail('Unauthenticated.'));
-      const record = kyc.get(currentUser.id);
+      const record = await kyc.get(currentUser.id);
       if (!record) {
         return ok('No KYC profile found.', { kyc: null, tier: 0, status: null });
       }
@@ -177,7 +198,7 @@ export function createKycPlugin(options: KycPluginOptions = {}) {
           return status(422, fail('Level must be 1 or 2.'));
         }
 
-        const existing = kyc.get(currentUser.id);
+        const existing = await kyc.get(currentUser.id);
         const isNew = !existing;
 
         // An approved KYC cannot be downgraded.
@@ -267,14 +288,13 @@ export function createKycPlugin(options: KycPluginOptions = {}) {
           submitted_at: nowIso(),
           reviewed_at: null,
         };
-        kyc.upsert(record);
-
+        const saved = await kyc.upsert(record);
         return status(isNew ? 201 : 200, {
           success: true as const,
           message: 'KYC submitted successfully. Our team will review it shortly.',
           data: {
-            tier: record.tier,
-            status: record.status,
+            tier: saved.tier,
+            status: saved.status,
           },
         });
       },

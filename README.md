@@ -75,6 +75,6 @@ All external services degrade to logged mock-mode when keys are absent (tests de
 
 ## Notes
 
-- JWT: `{sub, roles}`, 7-day expiry (Sanctum parity). Auth modules currently use in-memory stores behind `UserStore`/`OtpStore` interfaces — swap onto drizzle `users`/`otp_codes` for production persistence.
+- JWT: `{sub, roles}`, 7-day expiry (Sanctum parity). Auth / KYC / applications default to Postgres-backed stores (`src/db/stores.ts`, over `users` / `otp_codes` / `kyc_profiles` / `seller_applications` / `provider_applications`) while `DATABASE_URL` is reachable, and fall back to the in-memory singletons when it is not (one warning logged on connect failure). Tests pin explicit in-memory stores via plugin options. Public user ids are `String(users.id)` — the `users` table has no `uuid` column; the DB OTP store persists the plain code (`otp_codes.code` is varchar(10)) with the same TTL/attempt/single-use semantics as the memory store.
 - Chat `conversation_id` is the client's Firebase key (not the access check) — same contract as Laravel `ChatMessage::visibleTo()`.
 - Without a live `DATABASE_URL`, DB-backed routes (categories, listings, stores…) return 500; `/health`, `/api/v1/`, `/api/v1/adverts/active` (in-memory) respond without DB.
