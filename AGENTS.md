@@ -24,12 +24,17 @@ External services:
 3. **Response envelope**: every handler returns `{ success, message, data, errors }`
    via `ok()` / `created()` / `fail()` from `src/utils/response.ts`. Paginated lists
    add `meta: { current_page, per_page, total, last_page }` (see `src/utils/pagination.ts`).
-4. **Auth & guards** (`src/plugins/auth.ts`): use `requireAuth`, `notSuspended`,
-   `requireRole('admin'|'verifier')`, `requireKyc(1|2)`. JWT payload `{ sub, roles }`,
-   7-day expiry. Modules that cannot use the JWT derive yet (admin, media, payments,
-   chat, notifications, support, adverts, referrals, safety) use a documented local
-   header stub (`x-user-id` / `x-user-role`) — migrate these to the real guard as soon
-   as the auth plugin can propagate.
+4. **Auth & guards** (`src/modules/auth/index.ts`): `applyAuthGuard` attaches
+   the JWT guard directly to an instance (resolving `currentUser` from the
+   shared UserStore and rejecting unauthenticated/suspended callers),
+   `applyOptionalAuth` resolves `currentUser` without rejecting (for routes
+   that must stay reachable anonymously, e.g. referrals register, payments
+   webhook). JWT payload is `{ sub }` only — roles come from
+   `currentUser.roles` (store-loaded). Modules mint tokens via
+   `mintJwtToken(secret, userId)` and verify with `@elysiajs/jwt` (HS256,
+   7-day expiry). All route modules (auth, kyc, applications, admin, media,
+   payments, chat, notifications, support, adverts, referrals, safety) use the
+   real guard — no `x-user-id`/`x-user-role` header stubs remain.
 5. **Schema & migrations**: single source of truth `src/db/schema.ts` (drizzle pg
    schema, 38 tables). Generate SQL with `bun run db:generate`, apply with
    `bun run db:push` (dev) or `bun run db:migrate`. Never hand-edit `drizzle/*.sql`.

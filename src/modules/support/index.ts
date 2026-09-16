@@ -13,24 +13,14 @@
 //   GET   /support/tickets/:id        full thread (marks counterparty read)
 //   POST  /support/tickets/:id/reply  append message
 //   PATCH /support/tickets/:id/status owner: resolved|closed; staff: any
+//
+// Auth: real JWT guard (applyAuthGuard) resolving the shared UserStore.
+// User ids are strings (see src/db/stores.ts); the DB table contract for
+// support_tickets / support_messages lives in src/db/schema.ts.
 
 import { Elysia, t } from "elysia";
-import { pgTable, serial, integer, varchar, text, timestamp } from "drizzle-orm/pg-core";
-
-// ── Drizzle contract (Postgres wiring seam; runtime uses in-memory store) ──
-
-export const supportTickets = pgTable("support_tickets", {
-  id: serial("id").primaryKey(),
-  ticketNumber: varchar("ticket_number", { length: 20 }).notNull().unique(),
-  userId: integer("user_id").notNull(),
-  subject: varchar("subject", { length: 255 }).notNull(),
-  category: varchar("category", { length: 40 }).notNull().default("general_inquiry"),
-  priority: varchar("priority", { length: 10 }).notNull().default("normal"),
-  status: varchar("status", { length: 10 }).notNull().default("open"),
-  lastMessage: text("last_message"),
-  lastMessageAt: timestamp("last_message_at"),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+import { applyAuthGuard, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 
 // ── Constants (mirror SupportTicket model) ─────────────────────────────────
 
@@ -53,7 +43,7 @@ export const OWNER_SETTABLE_STATUSES = ["resolved", "closed"] as const;
 export interface TicketRow {
   id: number;
   ticketNumber: string;
-  userId: number;
+  userId: string;
   subject: string;
   category: string;
   priority: string;
@@ -61,7 +51,7 @@ export interface TicketRow {
   platform: string;
   lastMessage: string | null;
   lastMessageAt: string | null;
-  assigneeId: number | null;
+  assigneeId: string | null;
   resolvedAt: string | null;
   closedAt: string | null;
   createdAt: string;
@@ -70,30 +60,14 @@ export interface TicketRow {
 export interface TicketMessageRow {
   id: number;
   ticketId: number;
-  userId: number;
+  userId: string;
   senderType: "user" | "support" | "system";
   message: string;
   readAt: string | null;
   createdAt: string;
 }
 
-export interface AuthUser {
-  id: number;
-  name: string;
-  roles: string[];
-}
-
-function resolveUser(headers: Record<string, string | undefined>): AuthUser {
-  const id = Number(headers["x-user-id"] ?? "1");
-  const role = headers["x-user-role"];
-  return {
-    id: Number.isFinite(id) && id > 0 ? id : 1,
-    name: headers["x-user-name"] ?? "Test User",
-    roles: role ? [role] : [],
-  };
-}
-
-function isStaff(user: AuthUser): boolean {
+function isStaff(user: { roles: string[] }): boolean {
   return user.roles.includes("admin") || user.roles.includes("verifier");
 }
 
@@ -151,7 +125,7 @@ export class SupportStore {
   }
 
   /** Scoped lookup — invisible tickets read as undefined (→ 404). */
-  findTicket(userId: number, staff: boolean, id: number): TicketRow | undefined {
+  findTicket(userId: string, staff: boolean, id: number): TicketRow | undefined {
     const ticket = this.tickets.find((tk) => tk.id === id);
     if (!ticket) return undefined;
     if (!staff && ticket.userId !== userId) return undefined;
@@ -159,7 +133,7 @@ export class SupportStore {
   }
 
   createTicket(
-    userId: number,
+    userId: string,
     input: { subject: string; category?: string; priority?: string; message: string; platform?: string },
   ): { ticket: TicketRow; firstMessage: TicketMessageRow } {
     const now = new Date().toISOString();
@@ -199,7 +173,7 @@ export class SupportStore {
 
   reply(
     ticket: TicketRow,
-    userId: number,
+    userId: string,
     staff: boolean,
     message: string,
   ): { reply: TicketMessageRow } | { error: string } {
@@ -233,7 +207,7 @@ export class SupportStore {
 
   setStatus(
     ticket: TicketRow,
-    userId: number,
+    userId: string,
     staff: boolean,
     status: string,
   ): { ticket: TicketRow } | { error: string } {
@@ -273,16 +247,24 @@ const ticketBody = t.Object({
   platform: t.Optional(t.String()),
 });
 
-export const supportApp = new Elysia({ prefix: "/support" })
-  .derive(({ headers }) => ({ user: resolveUser(headers) }))
+export interface SupportPluginOptions {
+  users?: UserStore;
+  secret?: string;
+}
 
-  .get(
-    "/tickets",
-    ({ query, user }) => {
-      const staff = isStaff(user);
-      const page = Math.max(Number(query.page ?? "1") || 1, 1);
-      const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
-      let rows = supportStore.tickets.filter((tk) => staff || tk.userId === user.id);
+export function createSupportPlugin(options: SupportPluginOptions = {}) {
+  return applyAuthGuard(new Elysia({ prefix: "/support" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  })
+
+    .get(
+      "/tickets",
+      ({ query, currentUser }) => {
+        const staff = isStaff(currentUser);
+        const page = Math.max(Number(query.page ?? "1") || 1, 1);
+        const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
+        let rows = supportStore.tickets.filter((tk) => staff || tk.userId === currentUser.id);
       if (query.status) rows = rows.filter((tk) => tk.status === query.status);
       if (query.category) rows = rows.filter((tk) => tk.category === query.category);
       rows = rows.sort((a, b) => (a.lastMessageAt ?? a.createdAt) < (b.lastMessageAt ?? b.createdAt) ? 1 : -1);
@@ -305,13 +287,13 @@ export const supportApp = new Elysia({ prefix: "/support" })
     },
   )
 
-  .post("/tickets", ({ body, user, set }) => {
+  .post("/tickets", ({ body, currentUser, set }) => {
     const errors = validateTicketInput(body);
     if (errors.length > 0) {
       set.status = 422;
       return fail("Ticket validation failed.", errors);
     }
-    const { ticket } = supportStore.createTicket(user.id, {
+    const { ticket } = supportStore.createTicket(currentUser.id, {
       subject: body.subject,
       category: body.category,
       priority: body.priority,
@@ -322,20 +304,22 @@ export const supportApp = new Elysia({ prefix: "/support" })
     return ok("Support ticket created. Our team will respond shortly.", ticket);
   }, { body: ticketBody })
 
-  .get("/tickets/:id", ({ params, user, set }) => {
-    const ticket = supportStore.findTicket(user.id, isStaff(user), Number(params.id));
+  .get("/tickets/:id", ({ params, currentUser, set }) => {
+    const staff = isStaff(currentUser);
+    const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
     if (!ticket) {
       set.status = 404;
       return fail("Ticket not found.");
     }
-    supportStore.markThreadRead(ticket.id, isStaff(user));
+    supportStore.markThreadRead(ticket.id, staff);
     return ok("Ticket retrieved.", { ticket, messages: supportStore.thread(ticket.id) });
   }, { params: t.Object({ id: t.String() }) })
 
   .post(
     "/tickets/:id/reply",
-    ({ params, body, user, set }) => {
-      const ticket = supportStore.findTicket(user.id, isStaff(user), Number(params.id));
+    ({ params, body, currentUser, set }) => {
+      const staff = isStaff(currentUser);
+      const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
       if (!ticket) {
         set.status = 404;
         return fail("Ticket not found.");
@@ -344,7 +328,7 @@ export const supportApp = new Elysia({ prefix: "/support" })
         set.status = 422;
         return fail("message is required (max 5000 characters).");
       }
-      const result = supportStore.reply(ticket, user.id, isStaff(user), body.message);
+      const result = supportStore.reply(ticket, currentUser.id, staff, body.message);
       if ("error" in result) {
         set.status = 422;
         return fail(result.error);
@@ -357,13 +341,14 @@ export const supportApp = new Elysia({ prefix: "/support" })
 
   .patch(
     "/tickets/:id/status",
-    ({ params, body, user, set }) => {
-      const ticket = supportStore.findTicket(user.id, isStaff(user), Number(params.id));
+    ({ params, body, currentUser, set }) => {
+      const staff = isStaff(currentUser);
+      const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
       if (!ticket) {
         set.status = 404;
         return fail("Ticket not found.");
       }
-      const result = supportStore.setStatus(ticket, user.id, isStaff(user), body.status);
+      const result = supportStore.setStatus(ticket, currentUser.id, staff, body.status);
       if ("error" in result) {
         set.status = 422;
         return fail(result.error);
@@ -372,5 +357,9 @@ export const supportApp = new Elysia({ prefix: "/support" })
     },
     { params: t.Object({ id: t.String() }), body: t.Object({ status: t.String() }) },
   );
+}
+
+/** Default singleton plugin (real JWT guard; shared UserStore). */
+export const supportApp = createSupportPlugin();
 
 export default supportApp;

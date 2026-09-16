@@ -5,16 +5,18 @@
 // support / contact-update / advert / listing / broadcast review flows
 // via app.handle.
 
-import { test, expect, describe, beforeEach } from "bun:test";
+import { test, expect, describe, beforeAll, beforeEach } from "bun:test";
 import {
   AdminStore,
   buildDashboardStats,
   createAdminPlugin,
   hasRequiredRole,
-  resolveStaffUser,
   staffAccessError,
 } from "../src/modules/admin/index";
+import { MemoryUserStore, mintJwtToken } from "../src/modules/auth/index";
 import { nowIso } from "../src/utils/phone";
+
+const SECRET = "test-secret-for-admin";
 
 function json(method: string, path: string, body?: unknown, headers?: Record<string, string>) {
   return new Request(`http://localhost${path}`, {
@@ -30,12 +32,14 @@ async function handle(app: { handle: (req: Request) => Promise<Response> }, req:
   return { status: res.status, data };
 }
 
-const ADMIN = { "x-user-id": "admin_1", "x-user-role": "admin", "x-user-name": "Ada" };
-const VERIFIER = { "x-user-id": "ver_1", "x-user-role": "verifier" };
-const BUYER = { "x-user-id": "user_9", "x-user-role": "buyer" };
-
 let store: AdminStore;
+let users: MemoryUserStore;
 let app: ReturnType<typeof createAdminPlugin>;
+let ADMIN: Record<string, string>;
+let VERIFIER: Record<string, string>;
+let BUYER: Record<string, string>;
+let ADMIN_ID: string;
+let VERIFIER_ID: string;
 
 function seedUser(id: string, roles: string[], name = `User ${id}`): void {
   store.users.set(id, {
@@ -50,9 +54,24 @@ function seedUser(id: string, roles: string[], name = `User ${id}`): void {
   });
 }
 
+beforeAll(async () => {
+  users = new MemoryUserStore();
+  const admin = await users.create({ name: "Ada", email: "ada@example.com" });
+  await users.update(admin.id, { roles: ["admin"] });
+  const verifier = await users.create({ name: "Vera", email: "vera@example.com" });
+  await users.update(verifier.id, { roles: ["verifier"] });
+  const buyer = await users.create({ name: "Bob", email: "bob@example.com" });
+  await users.update(buyer.id, { roles: ["buyer"] });
+  ADMIN_ID = admin.id;
+  VERIFIER_ID = verifier.id;
+  ADMIN = { authorization: `Bearer ${await mintJwtToken(SECRET, admin.id)}` };
+  VERIFIER = { authorization: `Bearer ${await mintJwtToken(SECRET, verifier.id)}` };
+  BUYER = { authorization: `Bearer ${await mintJwtToken(SECRET, buyer.id)}` };
+});
+
 beforeEach(() => {
   store = new AdminStore();
-  app = createAdminPlugin({ store });
+  app = createAdminPlugin({ store, users, secret: SECRET });
 });
 
 describe("role guard logic", () => {
@@ -69,11 +88,11 @@ describe("role guard logic", () => {
     expect(hasRequiredRole(["admin", "verifier"], "admin")).toBe(true);
   });
 
-  test("resolveStaffUser + staffAccessError map to 401 / 403", () => {
+  test("staffAccessError maps no user / non-staff / staff to 401 / 403 / null", () => {
     expect(staffAccessError(null, "admin|verifier")?.status).toBe(401);
-    const buyer = resolveStaffUser({ "x-user-id": "u1", "x-user-role": "buyer" });
+    const buyer = { id: "u1", name: "Bob", roles: ["buyer"] };
     expect(staffAccessError(buyer, "admin|verifier")?.status).toBe(403);
-    const admin = resolveStaffUser({ "x-user-id": "a1", "x-user-role": "admin" });
+    const admin = { id: "a1", name: "Ada", roles: ["admin"] };
     expect(staffAccessError(admin, "admin|verifier")).toBeNull();
   });
 
@@ -300,7 +319,7 @@ describe("support queue + contact updates", () => {
     expect(listed.status).toBe(200);
     const assigned = await handle(app, json("POST", "/api/v1/admin/support/tickets/t1/assign", {}, VERIFIER));
     expect(assigned.status).toBe(200);
-    expect(store.tickets.get("t1")?.assignedTo).toBe("ver_1");
+    expect(store.tickets.get("t1")?.assignedTo).toBe(VERIFIER_ID);
   });
 
   test("contact update approve then double-review 422s", async () => {

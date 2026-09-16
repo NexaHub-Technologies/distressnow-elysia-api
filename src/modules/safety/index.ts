@@ -8,22 +8,14 @@
 //
 // Endpoint (mounted under /reports):
 //   POST /reports/safety   { target_type, target_id?, reason, details }
+//
+// Auth: real JWT guard (applyAuthGuard) resolving the shared UserStore.
+// User ids are strings (see src/db/stores.ts); the DB table contract for
+// safety_reports lives in src/db/schema.ts.
 
 import { Elysia, t } from "elysia";
-import { pgTable, serial, integer, varchar, text, timestamp } from "drizzle-orm/pg-core";
-
-// ── Drizzle contract (Postgres wiring seam; runtime uses in-memory store) ──
-
-export const safetyReports = pgTable("safety_reports", {
-  id: serial("id").primaryKey(),
-  uuid: varchar("uuid", { length: 36 }).notNull().unique(),
-  reporterId: integer("reporter_id").notNull(),
-  reportType: varchar("report_type", { length: 40 }).notNull(),
-  message: text("message").notNull(),
-  listingId: varchar("listing_id", { length: 36 }),
-  reportedUserId: integer("reported_user_id"),
-  status: varchar("status", { length: 20 }).notNull().default("pending"),
-});
+import { applyAuthGuard, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -45,29 +37,13 @@ export const SAFETY_STATUSES = ["pending", "reviewing", "resolved", "dismissed"]
 export interface SafetyReportRow {
   id: number;
   uuid: string;
-  reporterId: number;
+  reporterId: string;
   targetType: string;
   targetId: string | null;
   reason: string;
   details: string;
   status: string;
   createdAt: string;
-}
-
-export interface AuthUser {
-  id: number;
-  name: string;
-  roles: string[];
-}
-
-function resolveUser(headers: Record<string, string | undefined>): AuthUser {
-  const id = Number(headers["x-user-id"] ?? "1");
-  const role = headers["x-user-role"];
-  return {
-    id: Number.isFinite(id) && id > 0 ? id : 1,
-    name: headers["x-user-name"] ?? "Test User",
-    roles: role ? [role] : [],
-  };
 }
 
 function ok(message: string, data: unknown = null, meta?: unknown) {
@@ -116,7 +92,7 @@ export class SafetyStore {
   }
 
   submit(
-    reporterId: number,
+    reporterId: string,
     input: { target_type: string; target_id?: string | number | null; reason: string; details: string },
   ): SafetyReportRow {
     const row: SafetyReportRow = {
@@ -139,39 +115,51 @@ export const safetyStore = new SafetyStore();
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
-export const safetyApp = new Elysia({ prefix: "/reports" })
-  .derive(({ headers }) => ({ user: resolveUser(headers) }))
+export interface SafetyPluginOptions {
+  users?: UserStore;
+  secret?: string;
+}
 
-  .post(
-    "/safety",
-    ({ body, user, set }) => {
-      const errors = validateSafetyReport(body);
-      if (errors.length > 0) {
-        set.status = 422;
-        return fail("Safety report validation failed.", errors);
-      }
-      const report = safetyStore.submit(user.id, {
-        target_type: body.target_type,
-        target_id: body.target_id ?? null,
-        reason: body.reason,
-        details: body.details,
-      });
-      console.warn("[Safety] report submitted", {
-        report_uuid: report.uuid,
-        reason: report.reason,
-        reporter_id: report.reporterId,
-      });
-      set.status = 201;
-      return ok("Safety report submitted.", report);
-    },
-    {
-      body: t.Object({
-        target_type: t.String(),
-        target_id: t.Optional(t.Union([t.String(), t.Number(), t.Null()])),
-        reason: t.String(),
-        details: t.String(),
-      }),
-    },
-  );
+export function createSafetyPlugin(options: SafetyPluginOptions = {}) {
+  return applyAuthGuard(new Elysia({ prefix: "/reports" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  })
+
+    .post(
+      "/safety",
+      ({ body, currentUser, set }) => {
+        const errors = validateSafetyReport(body);
+        if (errors.length > 0) {
+          set.status = 422;
+          return fail("Safety report validation failed.", errors);
+        }
+        const report = safetyStore.submit(currentUser.id, {
+          target_type: body.target_type,
+          target_id: body.target_id ?? null,
+          reason: body.reason,
+          details: body.details,
+        });
+        console.warn("[Safety] report submitted", {
+          report_uuid: report.uuid,
+          reason: report.reason,
+          reporter_id: report.reporterId,
+        });
+        set.status = 201;
+        return ok("Safety report submitted.", report);
+      },
+      {
+        body: t.Object({
+          target_type: t.String(),
+          target_id: t.Optional(t.Union([t.String(), t.Number(), t.Null()])),
+          reason: t.String(),
+          details: t.String(),
+        }),
+      },
+    );
+}
+
+/** Default singleton plugin (real JWT guard; shared UserStore). */
+export const safetyApp = createSafetyPlugin();
 
 export default safetyApp;

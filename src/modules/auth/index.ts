@@ -20,6 +20,7 @@
 import { Elysia, t, type AnyElysia } from 'elysia';
 import { jwt } from '@elysiajs/jwt';
 import { getDbStores } from '../../db/stores';
+import { env } from '../../env';
 import { isEmailIdentifier, newId, normalizeEmail, normalizePhone, nowIso } from '../../utils/phone';
 import {
   otpStore as defaultOtpStore,
@@ -201,7 +202,7 @@ export const userStore = new MemoryUserStore();
 export const revokedTokens = new Set<string>();
 
 export function jwtSecret(): string {
-  return process.env.JWT_SECRET ?? 'dev-secret-change-me';
+  return env.JWT_SECRET;
 }
 
 // ── Envelope error mapping ───────────────────────────────────────────────────
@@ -285,6 +286,51 @@ export function applyAuthGuard<const T extends AnyElysia>(app: T, options: Guard
       }
       return undefined;
     });
+}
+
+/**
+ * Like applyAuthGuard, but never rejects — resolves `currentUser` (null when
+ * unauthenticated). Use for routes that must stay reachable anonymously while
+ * still being able to attribute the caller when a token is present
+ * (referrals, payments webhook, public listings reads, …).
+ */
+export function applyOptionalAuth<const T extends AnyElysia>(
+  app: T,
+  options: GuardOptions = {},
+) {
+  const secret = options.secret ?? jwtSecret();
+  const users = options.users ?? userStore;
+
+  return app
+    .use(jwt({ name: 'authJwt', secret }))
+    .resolve(async ({ headers, authJwt }) => {
+      let currentUser: AuthUser | null = null;
+      const token = bearerToken(headers.authorization);
+      if (token && !revokedTokens.has(token)) {
+        const payload = await authJwt.verify(token);
+        if (payload && typeof payload === 'object') {
+          const sub = (payload as { sub?: unknown }).sub;
+          if (typeof sub === 'string') {
+            currentUser = await users.findById(sub);
+          }
+        }
+      }
+      return { currentUser };
+    });
+}
+
+/** Sign an HS256 JWT with the same secret/claims the auth plugin uses. */
+export async function mintJwtToken(
+  secret: string,
+  userId: string,
+  ttlSeconds = 60 * 60 * 24 * 7,
+): Promise<string> {
+  const { SignJWT } = await import("jose");
+  return new SignJWT({ sub: userId })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(Date.now() / 1000) + ttlSeconds)
+    .sign(new TextEncoder().encode(secret));
 }
 
 // ── Social verification (minimal, mirrors SocialAuthService) ────────────────

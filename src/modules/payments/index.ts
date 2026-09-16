@@ -10,12 +10,12 @@
  *
  * All responses use the envelope { success, message, data } (same shape as
  * the auth module; ok()/fail() are defined locally to keep this module
- * decoupled until the shared plugin wiring lands).
+ * self-contained).
  *
- * Auth: local header stub (x-user-id required, x-user-email optional).
- * TODO(auth): replace resolvePaymentsUser() with createAuthGuard() from
- * ../auth/index once the auth integration pass happens — handlers already
- * treat the user as nullable and return 401 when it is null.
+ * Auth: applyOptionalAuth resolves the JWT bearer (shared UserStore); the
+ * routes that need a caller (initialize/verify) reject with 401 when no user
+ * is present, while the webhook stays public and relies on Paystack's HMAC
+ * signature instead.
  *
  * Persistence: in-memory TransactionStore behind a small interface.
  * TODO(db): swap MemoryTransactionStore for a drizzle-backed implementation
@@ -30,6 +30,8 @@ import {
   verifyTransaction,
   verifyWebhookSignature,
 } from "../../services/paystack";
+import { applyOptionalAuth, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 import { newId, nowIso } from "../../utils/phone";
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
@@ -48,24 +50,6 @@ export function fail(message: string): {
   data: null;
 } {
   return { success: false, message, data: null };
-}
-
-// ── Auth stub ────────────────────────────────────────────────────────────────
-
-export interface PaymentsUser {
-  id: string;
-  email: string;
-}
-
-export function resolvePaymentsUser(
-  headers: Record<string, string | string[] | undefined>,
-): PaymentsUser | null {
-  const rawId = headers["x-user-id"];
-  const id = Array.isArray(rawId) ? rawId[0] : rawId;
-  if (!id) return null;
-  const rawEmail = headers["x-user-email"];
-  const email = (Array.isArray(rawEmail) ? rawEmail[0] : rawEmail) || `${id}@example.com`;
-  return { id, email };
 }
 
 // ── Transaction store ────────────────────────────────────────────────────────
@@ -210,17 +194,23 @@ const VerifyBody = t.Object({
 
 export interface PaymentsPluginOptions {
   store?: TransactionStore;
+  users?: UserStore;
+  secret?: string;
 }
 
 export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
   const store = options.store ?? transactionStore;
 
-  return new Elysia({ prefix: "/api/v1/payments" })
+  return applyOptionalAuth(new Elysia({ prefix: "/api/v1/payments" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  })
     .post(
       "/initialize",
-      async ({ body, headers, status }) => {
-        const user = resolvePaymentsUser(headers);
-        if (!user) return status(401, fail("Unauthenticated."));
+      async ({ body, currentUser, status }) => {
+        if (!currentUser) return status(401, fail("Unauthenticated."));
+        const user = currentUser;
+        const userEmail = user.email ?? `${user.id}@example.com`;
 
         const amountKobo = Math.round(body.amount * 100);
         const reference = generateReference();
@@ -236,7 +226,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
 
         try {
           const paystack = await initializeTransaction({
-            email: user.email,
+            email: userEmail,
             amountKobo,
             reference,
             callbackUrl: body.callback_url,
@@ -266,9 +256,8 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
 
     .post(
       "/verify",
-      async ({ body, headers, status }) => {
-        const user = resolvePaymentsUser(headers);
-        if (!user) return status(401, fail("Unauthenticated."));
+      async ({ body, currentUser, status }) => {
+        if (!currentUser) return status(401, fail("Unauthenticated."));
 
         const transaction = store.findByReference(body.reference);
         if (!transaction) return status(404, fail("Transaction not found."));

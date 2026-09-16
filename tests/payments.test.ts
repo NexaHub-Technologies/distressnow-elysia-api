@@ -18,7 +18,9 @@ import {
   generateReference,
   MemoryTransactionStore,
 } from "../src/modules/payments/index";
+import { MemoryUserStore, mintJwtToken } from "../src/modules/auth/index";
 
+const SECRET = "test-secret-for-payments";
 const SECRET_KEYS = ["PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET"] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -61,8 +63,6 @@ async function handle(app: { handle: (req: Request) => Promise<Response> }, req:
   const data = (await res.json()) as Record<string, unknown>;
   return { status: res.status, data };
 }
-
-const AUTH = { "x-user-id": "user_1", "x-user-email": "buyer@example.com" };
 
 describe("webhook signature verification", () => {
   const secret = "test-secret-key";
@@ -134,12 +134,17 @@ describe("paystack mock mode", () => {
 
 describe("payments routes", () => {
   let store: MemoryTransactionStore;
+  let users: MemoryUserStore;
   let app: ReturnType<typeof createPaymentsPlugin>;
+  let auth: Record<string, string>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     clearPaystackSecrets();
     store = new MemoryTransactionStore();
-    app = createPaymentsPlugin({ store });
+    users = new MemoryUserStore();
+    const user = await users.create({ name: "Buyer", email: "buyer@example.com" });
+    auth = { authorization: `Bearer ${await mintJwtToken(SECRET, user.id)}` };
+    app = createPaymentsPlugin({ store, users, secret: SECRET });
   });
 
   afterEach(restorePaystackSecrets);
@@ -153,7 +158,7 @@ describe("payments routes", () => {
   test("POST /initialize creates a pending transaction (mock mode)", async () => {
     const { status, data } = await handle(
       app,
-      json("POST", "/api/v1/payments/initialize", { amount: 500 }, AUTH),
+      json("POST", "/api/v1/payments/initialize", { amount: 500 }, auth),
     );
     expect(status).toBe(201);
     expect(data.success).toBe(true);
@@ -169,7 +174,7 @@ describe("payments routes", () => {
   test("POST /initialize rejects amounts below ₦100", async () => {
     const { status } = await handle(
       app,
-      json("POST", "/api/v1/payments/initialize", { amount: 50 }, AUTH),
+      json("POST", "/api/v1/payments/initialize", { amount: 50 }, auth),
     );
     expect(status).toBe(422);
   });
@@ -177,7 +182,7 @@ describe("payments routes", () => {
   test("POST /verify returns 404 for unknown references", async () => {
     const { status, data } = await handle(
       app,
-      json("POST", "/api/v1/payments/verify", { reference: "TXN-NOPE" }, AUTH),
+      json("POST", "/api/v1/payments/verify", { reference: "TXN-NOPE" }, auth),
     );
     expect(status).toBe(404);
     expect(data.success).toBe(false);
@@ -186,13 +191,13 @@ describe("payments routes", () => {
   test("POST /verify marks a pending transaction successful (mock mode)", async () => {
     const init = await handle(
       app,
-      json("POST", "/api/v1/payments/initialize", { amount: 250 }, AUTH),
+      json("POST", "/api/v1/payments/initialize", { amount: 250 }, auth),
     );
     const reference = (init.data.data as Record<string, unknown>).reference as string;
 
     const { status, data } = await handle(
       app,
-      json("POST", "/api/v1/payments/verify", { reference }, AUTH),
+      json("POST", "/api/v1/payments/verify", { reference }, auth),
     );
     expect(status).toBe(200);
     expect(data.success).toBe(true);
@@ -206,7 +211,7 @@ describe("payments routes", () => {
 
     const { status, data } = await handle(
       app,
-      json("POST", "/api/v1/payments/verify", { reference }, AUTH),
+      json("POST", "/api/v1/payments/verify", { reference }, auth),
     );
     expect(status).toBe(200);
     expect(data.message).toContain("already processed");

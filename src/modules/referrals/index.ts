@@ -10,24 +10,17 @@
 // Endpoints (mounted under /referrals):
 //   POST /referrals/register     { code?, campaign?, metadata? }
 //   POST /referrals/attribution  { source, campaign?, event?, attribution_id?, metadata? }
+//
+// Auth: optional JWT guard (applyOptionalAuth). /register stays reachable
+// for pre-signup invite links (anonymous caller gets `userId: null`); the
+// body's `user_id` is accepted for legacy clients. /attribution REQUIRES a
+// caller (security: removes the former fallback to user 1).
+// User ids are strings (see src/db/stores.ts); the DB table contract for
+// referral_attributions lives in src/db/schema.ts.
 
 import { Elysia, t } from "elysia";
-import { pgTable, serial, integer, varchar, timestamp, jsonb } from "drizzle-orm/pg-core";
-
-// ── Drizzle contract (Postgres wiring seam; runtime uses in-memory store) ──
-
-export const referralAttributions = pgTable("referral_attributions", {
-  id: serial("id").primaryKey(),
-  uuid: varchar("uuid", { length: 36 }).notNull().unique(),
-  userId: integer("user_id"),
-  referralCode: varchar("referral_code", { length: 60 }),
-  campaignId: varchar("campaign_id", { length: 60 }),
-  status: varchar("status", { length: 20 }).notNull().default("pending"),
-  registeredUserId: integer("registered_user_id"),
-  metadata: jsonb("metadata"),
-  registeredAt: timestamp("registered_at"),
-  convertedAt: timestamp("converted_at"),
-});
+import { applyOptionalAuth, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -36,7 +29,7 @@ export const REFERRAL_STATUSES = ["pending", "registered", "converted"] as const
 export interface AttributionRow {
   id: number;
   uuid: string;
-  userId: number | null;
+  userId: string | null;
   code: string | null;
   campaign: string | null;
   source: string | null;
@@ -45,28 +38,6 @@ export interface AttributionRow {
   registeredAt: string | null;
   convertedAt: string | null;
   createdAt: string;
-}
-
-export interface AuthUser {
-  id: number;
-  name: string;
-  roles: string[];
-}
-
-function resolveUser(headers: Record<string, string | undefined>): AuthUser | null {
-  const raw = headers["x-user-id"];
-  if (raw === undefined || raw === "") {
-    // Register may be called pre-signup (invite link opened); allow anonymous.
-    return null;
-  }
-  const id = Number(raw);
-  if (!Number.isFinite(id) || id <= 0) return null;
-  const role = headers["x-user-role"];
-  return { id, name: headers["x-user-name"] ?? "Test User", roles: role ? [role] : [] };
-}
-
-function fallbackUser(): AuthUser {
-  return { id: 1, name: "Test User", roles: [] };
 }
 
 function ok(message: string, data: unknown = null, meta?: unknown) {
@@ -89,7 +60,7 @@ export class ReferralStore {
   }
 
   register(
-    userId: number | null,
+    userId: string | null,
     input: { code?: string | null; campaign?: string | null; metadata?: Record<string, unknown> },
   ): { row: AttributionRow } | { errors: string[] } {
     if (!input.code && !input.campaign) {
@@ -117,7 +88,7 @@ export class ReferralStore {
   }
 
   track(
-    userId: number | null,
+    userId: string | null,
     input: { source?: string | null; campaign?: string | null; event?: string | null; attribution_id?: string | null; metadata?: Record<string, unknown> },
   ): { row: AttributionRow } | { errors: string[] } {
     // Conversion against a known attribution (invited user acted).
@@ -157,62 +128,78 @@ export const referralStore = new ReferralStore();
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
-export const referralsApp = new Elysia({ prefix: "/referrals" })
-  .derive(({ headers }) => ({ authUser: resolveUser(headers) }))
+export interface ReferralsPluginOptions {
+  users?: UserStore;
+  secret?: string;
+}
 
-  .post(
-    "/register",
-    ({ body, authUser, set }) => {
-      const user = authUser ?? (body.user_id !== undefined && body.user_id !== null ? { id: body.user_id, name: "Test User", roles: [] as string[] } : null);
-      const result = referralStore.register(user?.id ?? null, {
-        code: body.code ?? null,
-        campaign: body.campaign ?? null,
-        metadata: body.metadata ?? {},
-      });
-      if ("errors" in result) {
-        set.status = 422;
-        return fail("Referral registration failed.", result.errors);
-      }
-      set.status = 201;
-      return ok("Referral registered.", result.row);
-    },
-    {
-      body: t.Object({
-        code: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
-        campaign: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
-        user_id: t.Optional(t.Union([t.Number(), t.Null()])),
-        metadata: t.Optional(t.Record(t.String(), t.Any())),
-      }),
-    },
-  )
+export function createReferralsPlugin(options: ReferralsPluginOptions = {}) {
+  return applyOptionalAuth(new Elysia({ prefix: "/referrals" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  })
 
-  .post(
-    "/attribution",
-    ({ body, authUser, set }) => {
-      const user = authUser ?? fallbackUser();
-      const result = referralStore.track(user.id, {
-        source: body.source ?? null,
-        campaign: body.campaign ?? null,
-        event: body.event ?? null,
-        attribution_id: body.attribution_id ?? null,
-        metadata: body.metadata ?? {},
-      });
-      if ("errors" in result) {
-        const missing = result.errors.includes("Attribution not found.");
-        set.status = missing ? 404 : 422;
-        return fail("Attribution tracking failed.", result.errors);
-      }
-      return ok("Attribution tracked.", result.row);
-    },
-    {
-      body: t.Object({
-        source: t.Optional(t.Union([t.String({ maxLength: 120 }), t.Null()])),
-        campaign: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
-        event: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
-        attribution_id: t.Optional(t.Union([t.String(), t.Null()])),
-        metadata: t.Optional(t.Record(t.String(), t.Any())),
-      }),
-    },
-  );
+    .post(
+      "/register",
+      ({ body, currentUser, set }) => {
+        // Pre-signup invite links: anonymous caller OR body.user_id (legacy).
+        const userId = currentUser?.id ?? (body.user_id !== undefined && body.user_id !== null ? String(body.user_id) : null);
+        const result = referralStore.register(userId, {
+          code: body.code ?? null,
+          campaign: body.campaign ?? null,
+          metadata: body.metadata ?? {},
+        });
+        if ("errors" in result) {
+          set.status = 422;
+          return fail("Referral registration failed.", result.errors);
+        }
+        set.status = 201;
+        return ok("Referral registered.", result.row);
+      },
+      {
+        body: t.Object({
+          code: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
+          campaign: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
+          user_id: t.Optional(t.Union([t.Number(), t.Null()])),
+          metadata: t.Optional(t.Record(t.String(), t.Any())),
+        }),
+      },
+    )
+
+    .post(
+      "/attribution",
+      ({ body, currentUser, set }) => {
+        if (!currentUser) {
+          set.status = 401;
+          return fail("Unauthenticated.");
+        }
+        const result = referralStore.track(currentUser.id, {
+          source: body.source ?? null,
+          campaign: body.campaign ?? null,
+          event: body.event ?? null,
+          attribution_id: body.attribution_id ?? null,
+          metadata: body.metadata ?? {},
+        });
+        if ("errors" in result) {
+          const missing = result.errors.includes("Attribution not found.");
+          set.status = missing ? 404 : 422;
+          return fail("Attribution tracking failed.", result.errors);
+        }
+        return ok("Attribution tracked.", result.row);
+      },
+      {
+        body: t.Object({
+          source: t.Optional(t.Union([t.String({ maxLength: 120 }), t.Null()])),
+          campaign: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
+          event: t.Optional(t.Union([t.String({ maxLength: 60 }), t.Null()])),
+          attribution_id: t.Optional(t.Union([t.String(), t.Null()])),
+          metadata: t.Optional(t.Record(t.String(), t.Any())),
+        }),
+      },
+    );
+}
+
+/** Default singleton plugin (optional JWT guard; shared UserStore). */
+export const referralsApp = createReferralsPlugin();
 
 export default referralsApp;

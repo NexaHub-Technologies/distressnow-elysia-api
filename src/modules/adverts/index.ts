@@ -9,26 +9,14 @@
 // Endpoints (mounted under /adverts):
 //   GET  /adverts/active   public, only live ads
 //   POST /adverts          auth, { title, image_url, link, starts_at, ends_at }
+//
+// Auth: optional JWT guard (applyOptionalAuth). GET /active stays public;
+// POST requires a caller (rejects 401 otherwise). User ids are strings
+// (see src/db/stores.ts); the DB table contract lives in src/db/schema.ts.
 
 import { Elysia, t } from "elysia";
-import { pgTable, serial, integer, varchar, text, timestamp, numeric } from "drizzle-orm/pg-core";
-
-// ── Drizzle contract (Postgres wiring seam; runtime uses in-memory store) ──
-
-export const adverts = pgTable("adverts", {
-  id: serial("id").primaryKey(),
-  uuid: varchar("uuid", { length: 36 }).notNull().unique(),
-  userId: integer("user_id").notNull(),
-  title: varchar("title", { length: 255 }).notNull(),
-  description: text("description"),
-  imagePath: varchar("image_path", { length: 2048 }),
-  targetUrl: varchar("target_url", { length: 500 }),
-  durationDays: integer("duration_days").notNull().default(7),
-  status: varchar("status", { length: 20 }).notNull().default("pending"),
-  amountPaid: numeric("amount_paid", { precision: 10, scale: 2 }).default("0"),
-  publishedAt: timestamp("published_at"),
-  expiresAt: timestamp("expires_at"),
-});
+import { applyOptionalAuth, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +25,7 @@ export const ADVERT_STATUSES = ["pending", "active", "expired", "unpublished"] a
 export interface AdvertRow {
   id: number;
   uuid: string;
-  userId: number;
+  userId: string;
   title: string;
   description: string | null;
   imageUrl: string | null;
@@ -46,22 +34,6 @@ export interface AdvertRow {
   endsAt: string | null;
   status: string;
   createdAt: string;
-}
-
-export interface AuthUser {
-  id: number;
-  name: string;
-  roles: string[];
-}
-
-function resolveUser(headers: Record<string, string | undefined>): AuthUser {
-  const id = Number(headers["x-user-id"] ?? "1");
-  const role = headers["x-user-role"];
-  return {
-    id: Number.isFinite(id) && id > 0 ? id : 1,
-    name: headers["x-user-name"] ?? "Test User",
-    roles: role ? [role] : [],
-  };
 }
 
 function ok(message: string, data: unknown = null, meta?: unknown) {
@@ -146,7 +118,7 @@ export class AdvertStore {
   }
 
   submit(
-    userId: number,
+    userId: string,
     input: { title: string; description?: string | null; image_url?: string | null; link?: string | null; starts_at?: string | null; ends_at?: string | null },
   ): AdvertRow {
     const row: AdvertRow = {
@@ -191,43 +163,59 @@ const advertBody = t.Object({
   ends_at: t.Optional(t.Union([t.String(), t.Null()])),
 });
 
-export const advertsApp = new Elysia({ prefix: "/adverts" })
-  .derive(({ headers }) => ({ user: resolveUser(headers) }))
+export interface AdvertsPluginOptions {
+  users?: UserStore;
+  secret?: string;
+}
 
-  // Public — the app display surface needs no token.
-  .get(
-    "/active",
-    ({ query }) => {
-      const page = Math.max(Number(query.page ?? "1") || 1, 1);
-      const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
-      const rows = advertStore.active();
-      const total = rows.length;
-      return ok("Active adverts retrieved.", rows.slice((page - 1) * perPage, page * perPage), {
-        page,
-        per_page: perPage,
-        total,
-        total_pages: Math.max(1, Math.ceil(total / perPage)),
+export function createAdvertsPlugin(options: AdvertsPluginOptions = {}) {
+  return applyOptionalAuth(new Elysia({ prefix: "/adverts" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  })
+
+    // Public — the app display surface needs no token.
+    .get(
+      "/active",
+      ({ query }) => {
+        const page = Math.max(Number(query.page ?? "1") || 1, 1);
+        const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
+        const rows = advertStore.active();
+        const total = rows.length;
+        return ok("Active adverts retrieved.", rows.slice((page - 1) * perPage, page * perPage), {
+          page,
+          per_page: perPage,
+          total,
+          total_pages: Math.max(1, Math.ceil(total / perPage)),
+        });
+      },
+      { query: t.Object({ page: t.Optional(t.String()), per_page: t.Optional(t.String()) }) },
+    )
+
+    .post("/", ({ body, currentUser, set }) => {
+      if (!currentUser) {
+        set.status = 401;
+        return fail("Unauthenticated.");
+      }
+      const errors = validateAdvertInput(body);
+      if (errors.length > 0) {
+        set.status = 422;
+        return fail("Advert validation failed.", errors);
+      }
+      const advert = advertStore.submit(currentUser.id, {
+        title: body.title,
+        description: body.description ?? null,
+        image_url: body.image_url ?? null,
+        link: body.link ?? null,
+        starts_at: body.starts_at ?? null,
+        ends_at: body.ends_at ?? null,
       });
-    },
-    { query: t.Object({ page: t.Optional(t.String()), per_page: t.Optional(t.String()) }) },
-  )
+      set.status = 201;
+      return ok("Advert submitted for review.", advert);
+    }, { body: advertBody });
+}
 
-  .post("/", ({ body, user, set }) => {
-    const errors = validateAdvertInput(body);
-    if (errors.length > 0) {
-      set.status = 422;
-      return fail("Advert validation failed.", errors);
-    }
-    const advert = advertStore.submit(user.id, {
-      title: body.title,
-      description: body.description ?? null,
-      image_url: body.image_url ?? null,
-      link: body.link ?? null,
-      starts_at: body.starts_at ?? null,
-      ends_at: body.ends_at ?? null,
-    });
-    set.status = 201;
-    return ok("Advert submitted for review.", advert);
-  }, { body: advertBody });
+/** Default singleton plugin (optional JWT guard; shared UserStore). */
+export const advertsApp = createAdvertsPlugin();
 
 export default advertsApp;

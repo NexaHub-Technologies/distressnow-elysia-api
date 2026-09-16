@@ -2,32 +2,34 @@
 //
 // Engagement modules: conversation grouping, unread counts, ticket
 // validation, broadcast payload (+ push mock mode, advert liveness,
-// safety validation, and route-level smoke tests via app.handle).
+// safety validation), and route-level tests via app.handle against
+// factory-built plugins authenticated with real JWT bearer tokens.
 
 import { test, expect, describe, beforeEach } from "bun:test";
 import {
-  chatApp,
   chatStore,
   participantKeyFor,
   groupConversations,
   getHistory,
   countUnread,
   markConversationRead,
+  createChatPlugin,
 } from "../src/modules/chat/index";
 import {
-  notificationsApp,
   notificationStore,
   pushTokenStore,
   sendNotification,
+  createNotificationsPlugin,
 } from "../src/modules/notifications/index";
 import {
-  supportApp,
   supportStore,
   validateTicketInput,
+  createSupportPlugin,
 } from "../src/modules/support/index";
-import { advertStore, advertsApp, isLive } from "../src/modules/adverts/index";
-import { referralStore } from "../src/modules/referrals/index";
-import { safetyStore, validateSafetyReport } from "../src/modules/safety/index";
+import { advertStore, isLive, createAdvertsPlugin } from "../src/modules/adverts/index";
+import { referralStore, createReferralsPlugin } from "../src/modules/referrals/index";
+import { safetyStore, validateSafetyReport, createSafetyPlugin } from "../src/modules/safety/index";
+import { MemoryUserStore, mintJwtToken } from "../src/modules/auth/index";
 import {
   DeviceTokenStore,
   buildBroadcastPayload,
@@ -37,6 +39,7 @@ import {
   sendPush,
 } from "../src/services/push";
 
+const SECRET = "test-secret-for-engagement";
 const TOKEN_A = "ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]";
 const TOKEN_B = "ExpoPushToken[bbbbbbbbbbbbbbbbbbbbbb]";
 
@@ -68,14 +71,14 @@ beforeEach(() => {
 
 describe("chat conversations", () => {
   test("participantKeyFor is order-independent", () => {
-    expect(participantKeyFor(3, 7)).toBe("3-7");
-    expect(participantKeyFor(7, 3)).toBe("3-7");
+    expect(participantKeyFor("3", "7")).toBe("3-7");
+    expect(participantKeyFor("7", "3")).toBe("3-7");
   });
 
   test("sync is idempotent on client_message_id replay", () => {
-    const item = { conversation_id: "conv-1", client_message_id: "c1", receiver_id: 2, message: "hi" };
-    const first = chatStore.syncBatch(1, [item]);
-    const second = chatStore.syncBatch(1, [item]);
+    const item = { conversation_id: "conv-1", client_message_id: "c1", receiver_id: "2", message: "hi" };
+    const first = chatStore.syncBatch("1", [item]);
+    const second = chatStore.syncBatch("1", [item]);
     expect(first.created).toHaveLength(1);
     expect(first.errors).toHaveLength(0);
     expect(second.created).toHaveLength(0);
@@ -84,84 +87,66 @@ describe("chat conversations", () => {
   });
 
   test("conversation_id reuse across pairs is rejected", () => {
-    chatStore.syncBatch(1, [{ conversation_id: "conv-x", client_message_id: "a", receiver_id: 2, message: "hi" }]);
-    const res = chatStore.syncBatch(1, [{ conversation_id: "conv-x", client_message_id: "b", receiver_id: 3, message: "yo" }]);
+    chatStore.syncBatch("1", [{ conversation_id: "conv-x", client_message_id: "a", receiver_id: "2", message: "hi" }]);
+    const res = chatStore.syncBatch("1", [{ conversation_id: "conv-x", client_message_id: "b", receiver_id: "3", message: "yo" }]);
     expect(res.errors).toHaveLength(1);
     expect(chatStore.messages).toHaveLength(1);
   });
 
   test("self-send is rejected", () => {
-    const res = chatStore.syncBatch(1, [{ conversation_id: "c", client_message_id: "a", receiver_id: 1, message: "hi" }]);
+    const res = chatStore.syncBatch("1", [{ conversation_id: "c", client_message_id: "a", receiver_id: "1", message: "hi" }]);
     expect(res.errors).toHaveLength(1);
   });
 
   test("groupConversations groups by conversation_id with last message + unread", () => {
-    chatStore.syncBatch(1, [
-      { conversation_id: "conv-a", client_message_id: "a1", receiver_id: 2, message: "first" },
-      { conversation_id: "conv-b", client_message_id: "b1", receiver_id: 3, message: "other" },
-      { conversation_id: "conv-a", client_message_id: "a2", receiver_id: 2, message: "second" },
+    chatStore.syncBatch("1", [
+      { conversation_id: "conv-a", client_message_id: "a1", receiver_id: "2", message: "first" },
+      { conversation_id: "conv-b", client_message_id: "b1", receiver_id: "3", message: "other" },
+      { conversation_id: "conv-a", client_message_id: "a2", receiver_id: "2", message: "second" },
     ]);
     // Simulate an inbound unread for user 1 in conv-a.
-    chatStore.syncBatch(2, [{ conversation_id: "conv-a", client_message_id: "a3", receiver_id: 1, message: "reply" }]);
+    chatStore.syncBatch("2", [{ conversation_id: "conv-a", client_message_id: "a3", receiver_id: "1", message: "reply" }]);
 
-    const inbox = groupConversations(chatStore, 1);
+    const inbox = groupConversations(chatStore, "1");
     expect(inbox).toHaveLength(2);
     const convA = inbox.find((c) => c.conversation_id === "conv-a");
     expect(convA?.last_message.message).toBe("reply");
     expect(convA?.unread_count).toBe(1);
-    expect(convA?.participant?.id).toBe(2);
+    expect(convA?.participant?.id).toBe("2");
     // Newest first.
     expect(inbox[0]?.conversation_id).toBe("conv-a");
   });
 
   test("countUnread ignores own sent messages and other conversations", () => {
-    chatStore.syncBatch(1, [{ conversation_id: "c1", client_message_id: "m1", receiver_id: 2, message: "out" }]);
-    chatStore.syncBatch(2, [{ conversation_id: "c1", client_message_id: "m2", receiver_id: 1, message: "in" }]);
-    expect(countUnread(chatStore.messages, 1)).toBe(1);
-    expect(countUnread(chatStore.messages, 1, "other")).toBe(0);
+    chatStore.syncBatch("1", [{ conversation_id: "c1", client_message_id: "m1", receiver_id: "2", message: "out" }]);
+    chatStore.syncBatch("2", [{ conversation_id: "c1", client_message_id: "m2", receiver_id: "1", message: "in" }]);
+    expect(countUnread(chatStore.messages, "1")).toBe(1);
+    expect(countUnread(chatStore.messages, "1", "other")).toBe(0);
   });
 
   test("markConversationRead zeroes the unread count", () => {
-    chatStore.syncBatch(2, [{ conversation_id: "c1", client_message_id: "m1", receiver_id: 1, message: "in" }]);
-    expect(markConversationRead(chatStore, 1, "c1")).toBe(1);
-    expect(countUnread(chatStore.messages, 1, "c1")).toBe(0);
+    chatStore.syncBatch("2", [{ conversation_id: "c1", client_message_id: "m1", receiver_id: "1", message: "in" }]);
+    expect(markConversationRead(chatStore, "1", "c1")).toBe(1);
+    expect(countUnread(chatStore.messages, "1", "c1")).toBe(0);
   });
 
   test("getHistory paginates newest-first with before cursor", () => {
     for (let i = 0; i < 5; i++) {
-      chatStore.syncBatch(1, [{ conversation_id: "c1", client_message_id: `m${i}`, receiver_id: 2, message: `msg-${i}` }]);
+      chatStore.syncBatch("1", [{ conversation_id: "c1", client_message_id: `m${i}`, receiver_id: "2", message: `msg-${i}` }]);
     }
-    const page1 = getHistory(chatStore, 1, "c1", false, { limit: 2 });
+    const page1 = getHistory(chatStore, "1", "c1", false, { limit: 2 });
     expect(page1.messages.map((m) => m.message)).toEqual(["msg-4", "msg-3"]);
     expect(page1.hasMore).toBe(true);
     const before = page1.messages[page1.messages.length - 1]?.id;
-    const page2 = getHistory(chatStore, 1, "c1", false, { limit: 2, before });
+    const page2 = getHistory(chatStore, "1", "c1", false, { limit: 2, before });
     expect(page2.messages.map((m) => m.message)).toEqual(["msg-2", "msg-1"]);
   });
 
   test("strangers see no rows for a guessed conversation_id", () => {
-    chatStore.syncBatch(1, [{ conversation_id: "secret", client_message_id: "m1", receiver_id: 2, message: "hi" }]);
-    const history = getHistory(chatStore, 999, "secret", false);
+    chatStore.syncBatch("1", [{ conversation_id: "secret", client_message_id: "m1", receiver_id: "2", message: "hi" }]);
+    const history = getHistory(chatStore, "999", "secret", false);
     expect(history.messages).toHaveLength(0);
-    expect(groupConversations(chatStore, 999)).toHaveLength(0);
-  });
-
-  test("POST /chat/sync then GET /chat/conversations (route smoke)", async () => {
-    const synced = await handle(chatApp, json("POST", "/chat/sync", {
-      messages: [{ conversation_id: "r1", client_message_id: "x1", receiver_id: 2, message: "hello" }],
-    }));
-    expect(synced.status).toBe(201);
-    expect((synced.data as { success: boolean }).success).toBe(true);
-
-    const inbox = await handle(chatApp, json("GET", "/chat/conversations"));
-    const rows = (inbox.data as { data: unknown[] }).data;
-    expect(rows).toHaveLength(1);
-  });
-
-  test("POST /chat/presence stores heartbeat", async () => {
-    const res = await handle(chatApp, json("POST", "/chat/presence", { is_online: true }));
-    expect(res.status).toBe(200);
-    expect(chatStore.presence.get(1)?.isOnline).toBe(true);
+    expect(groupConversations(chatStore, "999")).toHaveLength(0);
   });
 });
 
@@ -176,39 +161,22 @@ describe("support tickets", () => {
   });
 
   test("closed tickets reject replies; resolved reopens on user reply", () => {
-    const { ticket } = supportStore.createTicket(1, { subject: "s", message: "m" });
-    supportStore.setStatus(ticket, 1, true, "closed");
-    const denied = supportStore.reply(ticket, 1, false, "hello?");
+    const { ticket } = supportStore.createTicket("1", { subject: "s", message: "m" });
+    supportStore.setStatus(ticket, "1", true, "closed");
+    const denied = supportStore.reply(ticket, "1", false, "hello?");
     expect("error" in denied).toBe(true);
 
-    supportStore.setStatus(ticket, 1, true, "resolved");
-    const reopened = supportStore.reply(ticket, 1, false, "still broken");
+    supportStore.setStatus(ticket, "1", true, "resolved");
+    const reopened = supportStore.reply(ticket, "1", false, "still broken");
     expect("error" in reopened).toBe(false);
     expect(ticket.status).toBe("open");
   });
 
   test("owners may only resolve/close; staff may set any status", () => {
-    const { ticket } = supportStore.createTicket(1, { subject: "s", message: "m" });
-    expect("error" in supportStore.setStatus(ticket, 1, false, "pending")).toBe(true);
-    expect("error" in supportStore.setStatus(ticket, 1, false, "resolved")).toBe(false);
-    expect("error" in supportStore.setStatus(ticket, 9, true, "pending")).toBe(false);
-  });
-
-  test("POST /support/tickets 422 on empty body fields (route smoke)", async () => {
-    const res = await handle(supportApp, json("POST", "/support/tickets", { subject: "", message: "" }));
-    expect(res.status).toBe(422);
-    expect((res.data as { success: boolean }).success).toBe(false);
-  });
-
-  test("ticket thread marks counterparty messages read", async () => {
-    const created = await handle(
-      supportApp,
-      json("POST", "/support/tickets", { subject: "s", message: "m", category: "billing" }),
-    );
-    expect(created.status).toBe(201);
-    const id = (created.data as { data: { id: number } }).data.id;
-    const shown = await handle(supportApp, json("GET", `/support/tickets/${id}`));
-    expect(shown.status).toBe(200);
+    const { ticket } = supportStore.createTicket("1", { subject: "s", message: "m" });
+    expect("error" in supportStore.setStatus(ticket, "1", false, "pending")).toBe(true);
+    expect("error" in supportStore.setStatus(ticket, "1", false, "resolved")).toBe(false);
+    expect("error" in supportStore.setStatus(ticket, "9", true, "pending")).toBe(false);
   });
 });
 
@@ -217,20 +185,20 @@ describe("support tickets", () => {
 describe("expo push", () => {
   test("registerToken validates Expo format and reassigns across users", () => {
     const store = new DeviceTokenStore();
-    const bad = store.register({ userId: 1, token: "junk", platform: "ios" });
+    const bad = store.register({ userId: "1", token: "junk", platform: "ios" });
     expect(bad.errors.length).toBeGreaterThan(0);
-    const first = store.register({ userId: 1, token: TOKEN_A, platform: "ios" });
+    const first = store.register({ userId: "1", token: TOKEN_A, platform: "ios" });
     expect(first.errors).toHaveLength(0);
-    const moved = store.register({ userId: 2, token: TOKEN_A, platform: "android" });
-    expect(moved.row?.userId).toBe(2);
-    expect(store.forUser(1)).toHaveLength(0);
+    const moved = store.register({ userId: "2", token: TOKEN_A, platform: "android" });
+    expect(moved.row?.userId).toBe("2");
+    expect(store.forUser("1")).toHaveLength(0);
   });
 
   test("remove is scoped to the owning user", () => {
     const store = new DeviceTokenStore();
-    store.register({ userId: 1, token: TOKEN_A, platform: "ios" });
-    expect(store.remove(2, TOKEN_A)).toBe(false);
-    expect(store.remove(1, TOKEN_A)).toBe(true);
+    store.register({ userId: "1", token: TOKEN_A, platform: "ios" });
+    expect(store.remove("2", TOKEN_A)).toBe(false);
+    expect(store.remove("1", TOKEN_A)).toBe(true);
   });
 
   test("buildExpoMessages carries notification id + type in data", () => {
@@ -287,8 +255,8 @@ describe("expo push", () => {
     process.env.EXPO_PUSH_ENABLED = "true";
     try {
       const store = new DeviceTokenStore();
-      store.register({ userId: 1, token: TOKEN_A, platform: "ios" });
-      store.register({ userId: 1, token: TOKEN_B, platform: "ios" });
+      store.register({ userId: "1", token: TOKEN_A, platform: "ios" });
+      store.register({ userId: "1", token: TOKEN_B, platform: "ios" });
       const fakeFetch = (async () =>
         new Response(
           JSON.stringify({ data: [{ status: "ok" }, { status: "error", details: { error: "DeviceNotRegistered" } }] }),
@@ -296,11 +264,11 @@ describe("expo push", () => {
         )) as unknown as typeof fetch;
       const result = await sendPush(
         { id: 2, type: "chat_message", title: "T", body: "B" },
-        store.forUser(1),
+        store.forUser("1"),
         { fetchImpl: fakeFetch, store },
       );
       expect(result.pruned).toEqual([TOKEN_B]);
-      expect(store.forUser(1).map((r) => r.token)).toEqual([TOKEN_A]);
+      expect(store.forUser("1").map((r) => r.token)).toEqual([TOKEN_A]);
     } finally {
       if (prev === undefined) delete process.env.EXPO_PUSH_ENABLED;
       else process.env.EXPO_PUSH_ENABLED = prev;
@@ -308,71 +276,28 @@ describe("expo push", () => {
   });
 });
 
-// ── Notifications routes ───────────────────────────────────────────────────
-
-describe("notifications", () => {
-  test("feed carries account-wide unread_count; read-all zeroes it", async () => {
-    await sendNotification({ userId: 1, type: "support_reply", title: "T1", body: "B1" });
-    await sendNotification({ userId: 1, type: "support_reply", title: "T2", body: "B2" });
-    const feed = await handle(notificationsApp, json("GET", "/notifications?per_page=1"));
-    const body = feed.data as { data: unknown[]; meta: { unread_count: number; total: number } };
-    expect(body.data).toHaveLength(1);
-    expect(body.meta.unread_count).toBe(2);
-    expect(body.meta.total).toBe(2);
-
-    const all = await handle(notificationsApp, json("POST", "/notifications/read-all"));
-    expect((all.data as { data: { marked: number } }).data.marked).toBe(2);
-    expect(notificationStore.unreadCount(1)).toBe(0);
-  });
-
-  test("single read is scoped to owner (404 for strangers)", async () => {
-    const row = notificationStore.create({ userId: 1, type: "x", title: "T", body: "B" });
-    const stranger = await handle(notificationsApp, json("POST", `/notifications/${row.id}/read`, undefined, { "x-user-id": "2" }));
-    expect(stranger.status).toBe(404);
-    const owner = await handle(notificationsApp, json("POST", `/notifications/${row.id}/read`));
-    expect(owner.status).toBe(200);
-  });
-
-  test("push-token register + delete round-trip", async () => {
-    const reg = await handle(notificationsApp, json("POST", "/notifications/push-token", { token: TOKEN_A, platform: "ios" }));
-    expect(reg.status).toBe(200);
-    const bad = await handle(notificationsApp, json("POST", "/notifications/push-token", { token: "nope", platform: "ios" }));
-    expect(bad.status).toBe(422);
-    const del = await handle(notificationsApp, json("DELETE", "/notifications/push-token", { token: TOKEN_A }));
-    expect((del.data as { data: { removed: boolean } }).data.removed).toBe(true);
-  });
-});
-
-// ── Adverts / referrals / safety ───────────────────────────────────────────
+// ── Adverts / referrals / safety (store level) ─────────────────────────────
 
 describe("adverts", () => {
   test("isLive requires active status and open window", () => {
-    const base = advertStore.submit(1, { title: "A" });
+    const base = advertStore.submit("1", { title: "A" });
     expect(isLive(base)).toBe(false);
     advertStore.setStatus(base.id, "active");
     expect(isLive({ ...base, status: "active" })).toBe(true);
     expect(isLive({ ...base, status: "active", endsAt: new Date(Date.now() - 1000).toISOString() })).toBe(false);
     expect(isLive({ ...base, status: "active", startsAt: new Date(Date.now() + 60_000).toISOString() })).toBe(false);
   });
-
-  test("POST /adverts submits pending; GET /adverts/active hides it until live", async () => {
-    const created = await handle(advertsApp, json("POST", "/adverts", { title: "Sale", link: "https://example.com/sale" }));
-    expect(created.status).toBe(201);
-    expect((created.data as { data: { status: string } }).data.status).toBe("pending");
-    const feed = await handle(advertsApp, json("GET", "/adverts/active"));
-    expect((feed.data as { data: unknown[] }).data).toHaveLength(0);
-  });
 });
 
 describe("referrals", () => {
   test("register requires code or campaign; attribution converts by id", () => {
-    expect("errors" in referralStore.register(1, {})).toBe(true);
-    const reg = referralStore.register(1, { code: "INVITE-1" });
+    expect("errors" in referralStore.register("1", {})).toBe(true);
+    const reg = referralStore.register("1", { code: "INVITE-1" });
     expect("row" in reg && reg.row.status).toBe("registered");
     const anon = referralStore.register(null, { campaign: "launch" });
     expect("row" in anon && anon.row.status).toBe("pending");
     if ("row" in reg) {
-      const conv = referralStore.track(2, { attribution_id: reg.row.uuid, event: "signup" });
+      const conv = referralStore.track("2", { attribution_id: reg.row.uuid, event: "signup" });
       expect("row" in conv && conv.row.status).toBe("converted");
     }
   });
@@ -384,5 +309,166 @@ describe("safety reports", () => {
     expect(validateSafetyReport({ target_type: "user", reason: "nope", details: "x" }).length).toBeGreaterThan(0);
     expect(validateSafetyReport({ target_type: "listing", reason: "scam", details: "" }).length).toBeGreaterThan(0);
     expect(validateSafetyReport({ target_type: "listing", target_id: "abc", reason: "scam", details: "stolen pics" })).toHaveLength(0);
+  });
+});
+
+// ── Route-level auth smoke (real JWT bearer) ───────────────────────────────
+
+describe("engagement routes (JWT auth)", () => {
+  let users: MemoryUserStore;
+  let chatApp: ReturnType<typeof createChatPlugin>;
+  let supportApp: ReturnType<typeof createSupportPlugin>;
+  let notificationsApp: ReturnType<typeof createNotificationsPlugin>;
+  let advertsApp: ReturnType<typeof createAdvertsPlugin>;
+  let referralsApp: ReturnType<typeof createReferralsPlugin>;
+  let safetyApp: ReturnType<typeof createSafetyPlugin>;
+  let authA: Record<string, string>;
+  let authB: Record<string, string>;
+  let userAId: string;
+
+  beforeEach(async () => {
+    users = new MemoryUserStore();
+    const a = await users.create({ name: "Alice", email: "alice@example.com" });
+    const b = await users.create({ name: "Bob", email: "bob@example.com" });
+    userAId = a.id;
+    authA = { authorization: `Bearer ${await mintJwtToken(SECRET, a.id)}` };
+    authB = { authorization: `Bearer ${await mintJwtToken(SECRET, b.id)}` };
+    chatApp = createChatPlugin({ users, secret: SECRET });
+    supportApp = createSupportPlugin({ users, secret: SECRET });
+    notificationsApp = createNotificationsPlugin({ users, secret: SECRET });
+    advertsApp = createAdvertsPlugin({ users, secret: SECRET });
+    referralsApp = createReferralsPlugin({ users, secret: SECRET });
+    safetyApp = createSafetyPlugin({ users, secret: SECRET });
+  });
+
+  test("chat: unauthenticated requests are rejected", async () => {
+    const denied = await handle(chatApp, json("POST", "/chat/sync", {
+      messages: [{ conversation_id: "r1", client_message_id: "x1", receiver_id: 2, message: "hello" }],
+    }));
+    expect(denied.status).toBe(401);
+  });
+
+  test("chat: POST /chat/sync then GET /chat/conversations", async () => {
+    const synced = await handle(chatApp, json("POST", "/chat/sync", {
+      messages: [{ conversation_id: "r1", client_message_id: "x1", receiver_id: 2, message: "hello" }],
+    }, authA));
+    expect(synced.status).toBe(201);
+    expect((synced.data as { success: boolean }).success).toBe(true);
+
+    const inbox = await handle(chatApp, json("GET", "/chat/conversations", undefined, authA));
+    const rows = (inbox.data as { data: unknown[] }).data;
+    expect(rows).toHaveLength(1);
+  });
+
+  test("chat: POST /chat/presence stores heartbeat for the caller", async () => {
+    const res = await handle(chatApp, json("POST", "/chat/presence", { is_online: true }, authA));
+    expect(res.status).toBe(200);
+    expect(chatStore.presence.get(userAId)?.isOnline).toBe(true);
+  });
+
+  test("support: unauthenticated requests are rejected", async () => {
+    const denied = await handle(supportApp, json("POST", "/support/tickets", { subject: "s", message: "m" }));
+    expect(denied.status).toBe(401);
+  });
+
+  test("support: 422 on empty body fields", async () => {
+    const res = await handle(supportApp, json("POST", "/support/tickets", { subject: "", message: "" }, authA));
+    expect(res.status).toBe(422);
+    expect((res.data as { success: boolean }).success).toBe(false);
+  });
+
+  test("support: owner reads their ticket; strangers get 404", async () => {
+    const created = await handle(
+      supportApp,
+      json("POST", "/support/tickets", { subject: "s", message: "m", category: "billing" }, authA),
+    );
+    expect(created.status).toBe(201);
+    const id = (created.data as { data: { id: number } }).data.id;
+    const stranger = await handle(supportApp, json("GET", `/support/tickets/${id}`, undefined, authB));
+    expect(stranger.status).toBe(404);
+    const owner = await handle(supportApp, json("GET", `/support/tickets/${id}`, undefined, authA));
+    expect(owner.status).toBe(200);
+  });
+
+  test("notifications: feed carries account-wide unread_count; read-all zeroes it", async () => {
+    await sendNotification({ userId: userAId, type: "support_reply", title: "T1", body: "B1" });
+    await sendNotification({ userId: userAId, type: "support_reply", title: "T2", body: "B2" });
+    const feed = await handle(notificationsApp, json("GET", "/notifications?per_page=1", undefined, authA));
+    const body = feed.data as { data: unknown[]; meta: { unread_count: number; total: number } };
+    expect(body.data).toHaveLength(1);
+    expect(body.meta.unread_count).toBe(2);
+    expect(body.meta.total).toBe(2);
+
+    const all = await handle(notificationsApp, json("POST", "/notifications/read-all", undefined, authA));
+    expect((all.data as { data: { marked: number } }).data.marked).toBe(2);
+    expect(notificationStore.unreadCount(userAId)).toBe(0);
+  });
+
+  test("notifications: single read is scoped to owner (404 for strangers)", async () => {
+    const row = notificationStore.create({ userId: userAId, type: "x", title: "T", body: "B" });
+    const stranger = await handle(notificationsApp, json("POST", `/notifications/${row.id}/read`, undefined, authB));
+    expect(stranger.status).toBe(404);
+    const owner = await handle(notificationsApp, json("POST", `/notifications/${row.id}/read`, undefined, authA));
+    expect(owner.status).toBe(200);
+  });
+
+  test("notifications: push-token register + delete round-trip", async () => {
+    const reg = await handle(notificationsApp, json("POST", "/notifications/push-token", { token: TOKEN_A, platform: "ios" }, authA));
+    expect(reg.status).toBe(200);
+    const bad = await handle(notificationsApp, json("POST", "/notifications/push-token", { token: "nope", platform: "ios" }, authA));
+    expect(bad.status).toBe(422);
+    const del = await handle(notificationsApp, json("DELETE", "/notifications/push-token", { token: TOKEN_A }, authA));
+    expect((del.data as { data: { removed: boolean } }).data.removed).toBe(true);
+  });
+
+  test("adverts: POST submits pending; GET /active hides it until live", async () => {
+    const created = await handle(advertsApp, json("POST", "/adverts", { title: "Sale", link: "https://example.com/sale" }, authA));
+    expect(created.status).toBe(201);
+    expect((created.data as { data: { status: string } }).data.status).toBe("pending");
+    // /active stays public (no token) and excludes pending adverts.
+    const feed = await handle(advertsApp, json("GET", "/adverts/active"));
+    expect((feed.data as { data: unknown[] }).data).toHaveLength(0);
+  });
+
+  test("adverts: POST without a token is rejected", async () => {
+    const denied = await handle(advertsApp, json("POST", "/adverts", { title: "No auth" }));
+    expect(denied.status).toBe(401);
+  });
+
+  test("referrals: register works anonymously and with a token; attribution requires auth", async () => {
+    const anon = await handle(referralsApp, json("POST", "/referrals/register", { code: "INVITE-1" }));
+    expect(anon.status).toBe(201);
+    const authed = await handle(referralsApp, json("POST", "/referrals/register", { code: "INVITE-2" }, authA));
+    expect(authed.status).toBe(201);
+
+    const denied = await handle(referralsApp, json("POST", "/referrals/attribution", { source: "campaign" }));
+    expect(denied.status).toBe(401);
+    const tracked = await handle(
+      referralsApp,
+      json("POST", "/referrals/attribution", { source: "campaign", attribution_id: (authed.data as { data: { uuid: string } }).data.uuid }, authB),
+    );
+    expect(tracked.status).toBe(200);
+  });
+
+  test("safety: POST /reports/safety requires auth", async () => {
+    const denied = await handle(safetyApp, json("POST", "/reports/safety", {
+      target_type: "listing",
+      target_id: "abc",
+      reason: "scam",
+      details: "stolen pics",
+    }));
+    expect(denied.status).toBe(401);
+  });
+
+  test("safety: authenticated report is persisted", async () => {
+    const created = await handle(safetyApp, json("POST", "/reports/safety", {
+      target_type: "listing",
+      target_id: "abc",
+      reason: "scam",
+      details: "stolen pics",
+    }, authA));
+    expect(created.status).toBe(201);
+    expect((created.data as { data: { reporterId: string } }).data.reporterId).toBe(userAId);
+    expect(safetyStore.rows).toHaveLength(1);
   });
 });

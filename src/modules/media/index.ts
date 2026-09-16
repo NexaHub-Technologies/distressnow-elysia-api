@@ -7,12 +7,12 @@
  * Files are stored via src/services/storage.ts uploadBuffer() (Cloudinary,
  * mock mode when CLOUDINARY_* credentials are missing).
  *
- * Auth: local header stub (x-user-id required).
- * TODO(auth): replace resolveMediaUser() with createAuthGuard() from
- * ../auth/index once the auth integration pass happens.
+ * Auth: real JWT guard (applyAuthGuard) resolving the shared UserStore.
  */
 import { Elysia, t } from "elysia";
 import { uploadBuffer } from "../../services/storage";
+import { applyAuthGuard, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 
 // ── Envelope (same shape as the auth module) ─────────────────────────────────
 
@@ -30,21 +30,6 @@ export function fail(message: string): {
   data: null;
 } {
   return { success: false, message, data: null };
-}
-
-// ── Auth stub ────────────────────────────────────────────────────────────────
-
-export interface MediaUser {
-  id: string;
-}
-
-export function resolveMediaUser(
-  headers: Record<string, string | string[] | undefined>,
-): MediaUser | null {
-  const rawId = headers["x-user-id"];
-  const id = Array.isArray(rawId) ? rawId[0] : rawId;
-  if (!id) return null;
-  return { id };
 }
 
 // ── Folder validation ────────────────────────────────────────────────────────
@@ -69,12 +54,20 @@ const UploadBody = t.Object({
   folder: t.Optional(t.String({ maxLength: 128 })),
 });
 
-export function createMediaPlugin() {
-  return new Elysia({ prefix: "/api/v1/media" }).post(
+export interface MediaPluginOptions {
+  users?: UserStore;
+  secret?: string;
+}
+
+export function createMediaPlugin(options: MediaPluginOptions = {}) {
+  return applyAuthGuard(new Elysia({ prefix: "/api/v1/media" }), {
+    secret: options.secret,
+    users: options.users ?? getDbStores()?.users,
+  }).post(
     "/upload",
-    async ({ body, headers, status }) => {
-      const user = resolveMediaUser(headers);
-      if (!user) return status(401, fail("Unauthenticated."));
+    async ({ body, currentUser, status }) => {
+      if (!currentUser) return status(401, fail("Unauthenticated."));
+      const user = currentUser;
 
       let folder: string;
       try {

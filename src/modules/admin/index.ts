@@ -15,11 +15,8 @@
  * All responses use the envelope { success, message, data } (+ optional meta
  * for paginated lists).
  *
- * Auth: local header stub (x-user-id required, x-user-role single role or
- * comma-separated list, x-user-name optional).
- * TODO(auth): replace resolveStaffUser()/requireStaffRole() with
- * createAuthGuard() from ../auth/index plus a roles check against
- * currentUser.roles once the auth integration pass happens — handlers already
+ * Auth: real JWT guard (applyAuthGuard) resolving the shared UserStore; roles
+ * are read from `currentUser.roles` (the JWT carries only `sub`). Handlers
  * return 401/403 through the same envelope.
  *
  * Persistence: in-memory AdminStore behind a small class with reset().
@@ -29,6 +26,8 @@
  * and record an admin_logs row per mutating action.
  */
 import { Elysia, t } from "elysia";
+import { applyAuthGuard, type UserStore } from "../auth/index";
+import { getDbStores } from "../../db/stores";
 import { newId, nowIso } from "../../utils/phone";
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
@@ -56,23 +55,6 @@ export interface StaffUser {
   id: string;
   name: string;
   roles: string[];
-}
-
-export function resolveStaffUser(
-  headers: Record<string, string | string[] | undefined>,
-): StaffUser | null {
-  const rawId = headers["x-user-id"];
-  const id = Array.isArray(rawId) ? rawId[0] : rawId;
-  if (!id) return null;
-  const rawRole = headers["x-user-role"];
-  const roleHeader = Array.isArray(rawRole) ? rawRole.join(",") : (rawRole ?? "");
-  const roles = roleHeader
-    .split(",")
-    .map((role) => role.trim())
-    .filter((role) => role.length > 0);
-  const rawName = headers["x-user-name"];
-  const name = (Array.isArray(rawName) ? rawName[0] : rawName) || "Staff";
-  return { id, name, roles };
 }
 
 /**
@@ -468,6 +450,8 @@ const BroadcastBody = t.Object({
 
 export interface AdminPluginOptions {
   store?: AdminStore;
+  users?: UserStore;
+  secret?: string;
 }
 
 const STAFF = "admin|verifier";
@@ -476,17 +460,25 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
   const store = options.store ?? adminStore;
 
   return (
-    new Elysia({ prefix: "/api/v1/admin" })
+    applyAuthGuard(new Elysia({ prefix: "/api/v1/admin" }), {
+      secret: options.secret,
+      users: options.users ?? getDbStores()?.users,
+    })
+      .resolve(({ currentUser }) => ({
+        staff: currentUser
+          ? { id: currentUser.id, name: currentUser.name ?? "Staff", roles: currentUser.roles }
+          : null,
+      }))
       // ── Dashboard ──────────────────────────────────────────────────
-      .get("/dashboard/stats", ({ headers, status }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/dashboard/stats", ({ staff, status }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         return ok("Dashboard stats retrieved.", store.dashboardStats());
       })
 
       // ── KYC review ─────────────────────────────────────────────────
-      .get("/kyc", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/kyc", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.kyc.values()]
           .filter((item) => !query.status || item.status === query.status)
@@ -495,8 +487,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("KYC submissions retrieved.", data, meta);
       }, { query: KycQuery })
-      .post("/kyc/:id/approve", ({ headers, status, params }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/kyc/:id/approve", ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.kyc.get(params.id);
@@ -512,8 +503,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           status: item.status,
         });
       })
-      .post("/kyc/:id/reject", ({ headers, status, params, body }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/kyc/:id/reject", ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.kyc.get(params.id);
@@ -526,8 +516,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: ReasonBody })
 
       // ── Role applications ──────────────────────────────────────────
-      .get("/applications/sellers", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/applications/sellers", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.sellerApps.values()].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
@@ -535,8 +525,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Seller applications retrieved.", data, meta);
       }, { query: PaginationQuery })
-      .post("/applications/sellers/:id/approve", ({ headers, status, params }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/applications/sellers/:id/approve", ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.sellerApps.get(params.id);
@@ -548,8 +537,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         if (user && !user.roles.includes("seller")) user.roles.push("seller");
         return ok("Seller application approved.", { id: app.id, status: app.status });
       })
-      .post("/applications/sellers/:id/decline", ({ headers, status, params, body }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/applications/sellers/:id/decline", ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.sellerApps.get(params.id);
@@ -560,8 +548,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         app.reviewedAt = nowIso();
         return ok("Seller application declined.", { id: app.id });
       }, { body: ReasonBody })
-      .get("/applications/providers", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/applications/providers", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.providerApps.values()].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
@@ -569,8 +557,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Provider applications retrieved.", data, meta);
       }, { query: PaginationQuery })
-      .post("/applications/providers/:id/approve", ({ headers, status, params }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/applications/providers/:id/approve", ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.providerApps.get(params.id);
@@ -582,8 +569,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         if (user && !user.roles.includes("provider")) user.roles.push("provider");
         return ok("Provider application approved.", { id: app.id, status: app.status });
       })
-      .post("/applications/providers/:id/decline", ({ headers, status, params, body }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/applications/providers/:id/decline", ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.providerApps.get(params.id);
@@ -596,8 +582,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: ReasonBody })
 
       // ── User management ────────────────────────────────────────────
-      .get("/users", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/users", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const search = query.search?.toLowerCase();
         const items = [...store.users.values()]
@@ -613,8 +599,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 25);
         return ok("Users retrieved.", data, meta);
       }, { query: UsersQuery })
-      .post("/users/:id/suspend", ({ headers, status, params, body }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/users/:id/suspend", ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
@@ -624,8 +609,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         // TODO(db): revoke the user's API tokens so suspension logs them out.
         return ok(`User [${user.name}] has been suspended.`, serializeUser(user));
       }, { body: ReasonBody })
-      .post("/users/:id/unsuspend", ({ headers, status, params }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), "admin");
+      .post("/users/:id/unsuspend", ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
         if (!user) return status(404, fail("User not found."));
@@ -633,8 +618,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         user.suspensionReason = null;
         return ok(`User [${user.name}] has been unsuspended.`, serializeUser(user));
       })
-      .post("/users/:id/assign-role", ({ headers, status, params, body }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), "admin");
+      .post("/users/:id/assign-role", ({ staff, headers, status, params, body }) => {
+        const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
         if (!user) return status(404, fail("User not found."));
@@ -647,8 +632,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: AssignRoleBody })
 
       // ── Markets ────────────────────────────────────────────────────
-      .get("/markets", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/markets", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.markets.values()]
           .filter((market) => !query.state_id || market.stateId === query.state_id)
@@ -661,8 +646,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/markets", ({ headers, body, status }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .post("/markets", ({ staff, headers, body, status }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const market: MarketItem = {
           id: newId("market"),
@@ -679,8 +664,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         store.markets.set(market.id, market);
         return status(201, ok("Market created successfully.", serializeMarket(market)));
       }, { body: MarketBody })
-      .put("/markets/:id", ({ headers, status, params, body }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .put("/markets/:id", ({ staff, headers, status, params, body }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const market = store.markets.get(params.id);
         if (!market) return status(404, fail("Market not found."));
@@ -694,16 +679,16 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         if (body.is_active !== undefined) market.isActive = body.is_active;
         return ok("Market updated.", serializeMarket(market));
       }, { body: MarketUpdateBody })
-      .delete("/markets/:id", ({ headers, status, params }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .delete("/markets/:id", ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         if (!store.markets.delete(params.id)) return status(404, fail("Market not found."));
         return ok("Market deleted successfully.", null);
       })
 
       // ── Support queue ──────────────────────────────────────────────
-      .get("/support/tickets", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/support/tickets", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.tickets.values()]
           .filter((ticket) => !query.status || ticket.status === query.status)
@@ -717,8 +702,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/support/tickets/:id/assign", ({ headers, status, params, body }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/support/tickets/:id/assign", ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const ticket = store.tickets.get(params.id);
@@ -733,8 +717,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: AssignTicketBody })
 
       // ── Contact updates ────────────────────────────────────────────
-      .get("/contact-updates", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/contact-updates", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.contactUpdates.values()]
           .filter((item) => !query.status || item.status === query.status)
@@ -748,8 +732,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/contact-updates/:id/approve", ({ headers, status, params }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/contact-updates/:id/approve", ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.contactUpdates.get(params.id);
@@ -762,8 +745,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         item.reviewedAt = nowIso();
         return ok("Contact update approved and applied.", item);
       })
-      .post("/contact-updates/:id/reject", ({ headers, status, params }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/contact-updates/:id/reject", ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.contactUpdates.get(params.id);
@@ -778,8 +760,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       })
 
       // ── Adverts ────────────────────────────────────────────────────
-      .get("/adverts", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/adverts", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.adverts.values()]
           .filter((advert) => !query.status || advert.status === query.status)
@@ -787,8 +769,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Adverts retrieved.", data, meta);
       }, { query: AdvertsQuery })
-      .get("/adverts/stats", ({ headers, status }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/adverts/stats", ({ staff, headers, status }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const adverts = [...store.adverts.values()];
         return ok("Advert stats retrieved.", {
@@ -799,8 +781,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           revenue: adverts.reduce((sum, advert) => sum + advert.amountPaid, 0),
         });
       })
-      .post("/adverts/:id/publish", ({ headers, status, params }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .post("/adverts/:id/publish", ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const advert = store.adverts.get(params.id);
         if (!advert) return status(404, fail("Advert not found."));
@@ -812,8 +794,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         ).toISOString();
         return ok("Advert published.", advert);
       })
-      .post("/adverts/:id/unpublish", ({ headers, status, params }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .post("/adverts/:id/unpublish", ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const advert = store.adverts.get(params.id);
         if (!advert) return status(404, fail("Advert not found."));
@@ -822,8 +804,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       })
 
       // ── Listing review ─────────────────────────────────────────────
-      .get("/listings", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .get("/listings", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.listings.values()]
           .filter((listing) => !query.deal_type || listing.dealType === query.deal_type)
@@ -832,8 +814,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Listings retrieved.", data, meta);
       }, { query: ListingsQuery })
-      .post("/listings/:id/approve", ({ headers, status, params }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .post("/listings/:id/approve", ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
         if (!listing) return status(404, fail("Listing not found."));
@@ -841,8 +823,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         listing.status = "active";
         return ok(`Listing "${listing.title}" approved and is now live.`, listing);
       })
-      .post("/listings/:id/reject", ({ headers, status, params, body }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), STAFF);
+      .post("/listings/:id/reject", ({ staff, headers, status, params, body }) => {
+        const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
         if (!listing) return status(404, fail("Listing not found."));
@@ -850,8 +832,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         listing.status = "inactive";
         return ok(`Listing "${listing.title}" rejected.`, listing);
       }, { body: ReasonBody })
-      .post("/listings/:id/feature", ({ headers, status, params, body }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), "admin");
+      .post("/listings/:id/feature", ({ staff, headers, status, params, body }) => {
+        const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
         if (!listing) return status(404, fail("Listing not found."));
@@ -870,15 +852,14 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: FeatureBody })
 
       // ── Notification broadcasts (admin only, throttled) ────────────
-      .get("/notifications/broadcasts", ({ headers, status, query }) => {
-        const denied = staffAccessError(resolveStaffUser(headers), "admin");
+      .get("/notifications/broadcasts", ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const items = [...store.broadcasts].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Broadcasts retrieved.", { broadcasts: data }, meta);
       }, { query: PaginationQuery })
-      .post("/notifications/broadcast", ({ headers, body, status }) => {
-        const staff = resolveStaffUser(headers);
+      .post("/notifications/broadcast", ({ staff, headers, body, status }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const adminId = (staff as StaffUser).id;
