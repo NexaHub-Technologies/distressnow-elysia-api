@@ -152,6 +152,21 @@ export class AdvertStore {
 
 export const advertStore = new AdvertStore();
 
+/**
+ * Store surface consumed by the route handlers. Returns are widened to
+ * `T | Promise<T>` so the DB-backed overlay (createDbAdvertStore) can
+ * implement the same shape as the in-memory AdvertStore.
+ */
+export interface AdvertStoreLike {
+  submit(
+    userId: string,
+    input: { title: string; description?: string | null; image_url?: string | null; link?: string | null; starts_at?: string | null; ends_at?: string | null },
+  ): AdvertRow | Promise<AdvertRow>;
+  setStatus(id: number, status: string): AdvertRow | undefined | Promise<AdvertRow | undefined>;
+  active(now?: number): AdvertRow[] | Promise<AdvertRow[]>;
+  reset(): void | Promise<void>;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 const advertBody = t.Object({
@@ -166,9 +181,13 @@ const advertBody = t.Object({
 export interface AdvertsPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** Advert store (memory default; DB-backed in production). */
+  store?: AdvertStoreLike;
 }
 
 export function createAdvertsPlugin(options: AdvertsPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.adverts ?? advertStore;
+
   return applyOptionalAuth(new Elysia({ prefix: "/adverts" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -177,10 +196,10 @@ export function createAdvertsPlugin(options: AdvertsPluginOptions = {}) {
     // Public — the app display surface needs no token.
     .get(
       "/active",
-      ({ query }) => {
+      async ({ query }) => {
         const page = Math.max(Number(query.page ?? "1") || 1, 1);
         const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
-        const rows = advertStore.active();
+        const rows = await store.active();
         const total = rows.length;
         return ok("Active adverts retrieved.", rows.slice((page - 1) * perPage, page * perPage), {
           page,
@@ -192,7 +211,7 @@ export function createAdvertsPlugin(options: AdvertsPluginOptions = {}) {
       { query: t.Object({ page: t.Optional(t.String()), per_page: t.Optional(t.String()) }) },
     )
 
-    .post("/", ({ body, currentUser, set }) => {
+    .post("/", async ({ body, currentUser, set }) => {
       if (!currentUser) {
         set.status = 401;
         return fail("Unauthenticated.");
@@ -202,7 +221,7 @@ export function createAdvertsPlugin(options: AdvertsPluginOptions = {}) {
         set.status = 422;
         return fail("Advert validation failed.", errors);
       }
-      const advert = advertStore.submit(currentUser.id, {
+      const advert = await store.submit(currentUser.id, {
         title: body.title,
         description: body.description ?? null,
         image_url: body.image_url ?? null,

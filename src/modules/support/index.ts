@@ -132,6 +132,13 @@ export class SupportStore {
     return ticket;
   }
 
+  /** Inbox listing: staff see everything, users only their own; newest first. */
+  listFor(userId: string, staff: boolean): TicketRow[] {
+    return this.tickets
+      .filter((tk) => staff || tk.userId === userId)
+      .sort((a, b) => ((a.lastMessageAt ?? a.createdAt) < (b.lastMessageAt ?? b.createdAt) ? 1 : -1));
+  }
+
   createTicket(
     userId: string,
     input: { subject: string; category?: string; priority?: string; message: string; platform?: string },
@@ -237,6 +244,48 @@ export class SupportStore {
 
 export const supportStore = new SupportStore();
 
+/**
+ * Store surface consumed by the route handlers. Returns are widened to
+ * `T | Promise<T>` so the DB-backed overlay (createDbSupportStore) can
+ * implement the same shape as the in-memory SupportStore — handlers
+ * uniformly `await`, which is a no-op for the synchronous memory store.
+ *
+ * `reply` / `setStatus` additionally mutate the caller-held TicketRow in
+ * place (handlers read `ticket.status` / `ticketNumber` / `lastMessage`
+ * after the call).
+ */
+export interface SupportStoreLike {
+  findTicket(userId: string, staff: boolean, id: number): TicketRow | undefined | Promise<TicketRow | undefined>;
+  listFor(userId: string, staff: boolean): TicketRow[] | Promise<TicketRow[]>;
+  createTicket(
+    userId: string,
+    input: { subject: string; category?: string; priority?: string; message: string; platform?: string },
+  ):
+    | { ticket: TicketRow; firstMessage: TicketMessageRow }
+    | Promise<{ ticket: TicketRow; firstMessage: TicketMessageRow }>;
+  thread(ticketId: number): TicketMessageRow[] | Promise<TicketMessageRow[]>;
+  reply(
+    ticket: TicketRow,
+    userId: string,
+    staff: boolean,
+    message: string,
+  ):
+    | { reply: TicketMessageRow }
+    | { error: string }
+    | Promise<{ reply: TicketMessageRow } | { error: string }>;
+  setStatus(
+    ticket: TicketRow,
+    userId: string,
+    staff: boolean,
+    status: string,
+  ):
+    | { ticket: TicketRow }
+    | { error: string }
+    | Promise<{ ticket: TicketRow } | { error: string }>;
+  markThreadRead(ticketId: number, viewerStaff: boolean): void | Promise<void>;
+  reset(): void | Promise<void>;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 const ticketBody = t.Object({
@@ -250,9 +299,13 @@ const ticketBody = t.Object({
 export interface SupportPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** Ticket store (memory default; DB-backed in production). */
+  store?: SupportStoreLike;
 }
 
 export function createSupportPlugin(options: SupportPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.support ?? supportStore;
+
   return applyAuthGuard(new Elysia({ prefix: "/support" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -260,14 +313,13 @@ export function createSupportPlugin(options: SupportPluginOptions = {}) {
 
     .get(
       "/tickets",
-      ({ query, currentUser }) => {
+      async ({ query, currentUser }) => {
         const staff = isStaff(currentUser);
         const page = Math.max(Number(query.page ?? "1") || 1, 1);
         const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
-        let rows = supportStore.tickets.filter((tk) => staff || tk.userId === currentUser.id);
+        let rows = await store.listFor(currentUser.id, staff);
       if (query.status) rows = rows.filter((tk) => tk.status === query.status);
       if (query.category) rows = rows.filter((tk) => tk.category === query.category);
-      rows = rows.sort((a, b) => (a.lastMessageAt ?? a.createdAt) < (b.lastMessageAt ?? b.createdAt) ? 1 : -1);
       const total = rows.length;
       const items = rows.slice((page - 1) * perPage, page * perPage);
       return ok("Tickets retrieved.", items, {
@@ -287,13 +339,13 @@ export function createSupportPlugin(options: SupportPluginOptions = {}) {
     },
   )
 
-  .post("/tickets", ({ body, currentUser, set }) => {
+  .post("/tickets", async ({ body, currentUser, set }) => {
     const errors = validateTicketInput(body);
     if (errors.length > 0) {
       set.status = 422;
       return fail("Ticket validation failed.", errors);
     }
-    const { ticket } = supportStore.createTicket(currentUser.id, {
+    const { ticket } = await store.createTicket(currentUser.id, {
       subject: body.subject,
       category: body.category,
       priority: body.priority,
@@ -304,22 +356,22 @@ export function createSupportPlugin(options: SupportPluginOptions = {}) {
     return ok("Support ticket created. Our team will respond shortly.", ticket);
   }, { body: ticketBody })
 
-  .get("/tickets/:id", ({ params, currentUser, set }) => {
+  .get("/tickets/:id", async ({ params, currentUser, set }) => {
     const staff = isStaff(currentUser);
-    const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
+    const ticket = await store.findTicket(currentUser.id, staff, Number(params.id));
     if (!ticket) {
       set.status = 404;
       return fail("Ticket not found.");
     }
-    supportStore.markThreadRead(ticket.id, staff);
-    return ok("Ticket retrieved.", { ticket, messages: supportStore.thread(ticket.id) });
+    await store.markThreadRead(ticket.id, staff);
+    return ok("Ticket retrieved.", { ticket, messages: await store.thread(ticket.id) });
   }, { params: t.Object({ id: t.String() }) })
 
   .post(
     "/tickets/:id/reply",
-    ({ params, body, currentUser, set }) => {
+    async ({ params, body, currentUser, set }) => {
       const staff = isStaff(currentUser);
-      const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
+      const ticket = await store.findTicket(currentUser.id, staff, Number(params.id));
       if (!ticket) {
         set.status = 404;
         return fail("Ticket not found.");
@@ -328,7 +380,7 @@ export function createSupportPlugin(options: SupportPluginOptions = {}) {
         set.status = 422;
         return fail("message is required (max 5000 characters).");
       }
-      const result = supportStore.reply(ticket, currentUser.id, staff, body.message);
+      const result = await store.reply(ticket, currentUser.id, staff, body.message);
       if ("error" in result) {
         set.status = 422;
         return fail(result.error);
@@ -341,14 +393,14 @@ export function createSupportPlugin(options: SupportPluginOptions = {}) {
 
   .patch(
     "/tickets/:id/status",
-    ({ params, body, currentUser, set }) => {
+    async ({ params, body, currentUser, set }) => {
       const staff = isStaff(currentUser);
-      const ticket = supportStore.findTicket(currentUser.id, staff, Number(params.id));
+      const ticket = await store.findTicket(currentUser.id, staff, Number(params.id));
       if (!ticket) {
         set.status = 404;
         return fail("Ticket not found.");
       }
-      const result = supportStore.setStatus(ticket, currentUser.id, staff, body.status);
+      const result = await store.setStatus(ticket, currentUser.id, staff, body.status);
       if ("error" in result) {
         set.status = 422;
         return fail(result.error);

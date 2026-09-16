@@ -20,7 +20,7 @@
 import { Elysia, t } from "elysia";
 import { applyAuthGuard, type UserStore } from "../auth/index";
 import { getDbStores } from "../../db/stores";
-import { DeviceTokenStore, sendPush } from "../../services/push";
+import { DeviceTokenStore, sendPush, type DeviceTokenRegistry } from "../../services/push";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -105,24 +105,50 @@ export class NotificationStore {
   }
 }
 
+/**
+ * Store surface consumed by the route handlers. Returns are widened to
+ * `T | Promise<T>` so the DB-backed overlay (createDbNotificationStore) can
+ * implement the same shape as the in-memory NotificationStore — handlers
+ * uniformly `await`, which is a no-op for the synchronous memory store.
+ */
+export interface NotificationStoreLike {
+  create(input: { userId: string; type: string; title: string; body: string; data?: Record<string, unknown> | null }):
+    | NotificationRow
+    | Promise<NotificationRow>;
+  forUser(userId: string): NotificationRow[] | Promise<NotificationRow[]>;
+  unreadCount(userId: string): number | Promise<number>;
+  markRead(userId: string, id: number): NotificationRow | null | Promise<NotificationRow | null>;
+  markAllRead(userId: string): number | Promise<number>;
+  reset(): void | Promise<void>;
+}
+
 export const notificationStore = new NotificationStore();
 export const pushTokenStore = new DeviceTokenStore();
 
 /**
  * Single entry point for notifying a user: persist the in-app row, then
  * fan out to push best-effort. Never throws.
+ *
+ * Resolves the DB-backed stores when Postgres is reachable, falling back to
+ * the module singletons (which is the memory path tests run on). Callers can
+ * pin explicit stores via the second argument to stay on a specific store.
  */
-export async function sendNotification(input: {
-  userId: string;
-  type: string;
-  title: string;
-  body: string;
-  data?: Record<string, unknown> | null;
-}) {
-  const row = notificationStore.create(input);
-  const tokens = pushTokenStore.forUser(input.userId);
+export async function sendNotification(
+  input: {
+    userId: string;
+    type: string;
+    title: string;
+    body: string;
+    data?: Record<string, unknown> | null;
+  },
+  stores?: { store?: NotificationStoreLike; pushTokens?: DeviceTokenRegistry },
+) {
+  const store = stores?.store ?? getDbStores()?.notifications ?? notificationStore;
+  const pushTokens = stores?.pushTokens ?? getDbStores()?.deviceTokens ?? pushTokenStore;
+  const row = await store.create(input);
+  const tokens = await pushTokens.forUser(input.userId);
   await sendPush({ id: row.id, type: row.type, title: row.title, body: row.body, data: row.data }, tokens, {
-    store: pushTokenStore,
+    store: pushTokens,
   });
   return row;
 }
@@ -139,9 +165,16 @@ const pushTokenBody = t.Object({
 export interface NotificationsPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** In-app notification store (memory default; DB-backed in production). */
+  store?: NotificationStoreLike;
+  /** Push-token registry (memory default; DB-backed in production). */
+  pushTokens?: DeviceTokenRegistry;
 }
 
 export function createNotificationsPlugin(options: NotificationsPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.notifications ?? notificationStore;
+  const pushTokens = options.pushTokens ?? getDbStores()?.deviceTokens ?? pushTokenStore;
+
   return applyAuthGuard(new Elysia({ prefix: "/notifications" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -149,10 +182,10 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
 
     .get(
       "/",
-      ({ query, currentUser }) => {
+      async ({ query, currentUser }) => {
         const page = Math.max(Number(query.page ?? "1") || 1, 1);
         const perPage = Math.min(Math.max(Number(query.per_page ?? "20") || 20, 1), 100);
-        let rows = notificationStore.forUser(currentUser.id);
+        let rows = await store.forUser(currentUser.id);
         if (query.unread === "true" || query.unread === "1") rows = rows.filter((r) => r.readAt === null);
         if (query.type) rows = rows.filter((r) => r.type === query.type);
         const { items, total, totalPages } = paginate(rows, page, perPage);
@@ -161,7 +194,7 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
           per_page: perPage,
           total,
           total_pages: totalPages,
-          unread_count: notificationStore.unreadCount(currentUser.id),
+          unread_count: await store.unreadCount(currentUser.id),
         });
       },
       {
@@ -174,9 +207,9 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
       },
     )
 
-    .post("/push-token", ({ body, currentUser, set }) => {
+    .post("/push-token", async ({ body, currentUser, set }) => {
       const token = body.token ?? body.device_token ?? "";
-      const { row, errors } = pushTokenStore.register({
+      const { row, errors } = await pushTokens.register({
         userId: currentUser.id,
         token,
         platform: body.platform,
@@ -191,9 +224,9 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
 
     .delete(
       "/push-token",
-      ({ body, query, currentUser }) => {
+      async ({ body, query, currentUser }) => {
         const token = body?.token ?? body?.device_token ?? query.token ?? query.device_token ?? "";
-        const removed = pushTokenStore.remove(currentUser.id, token);
+        const removed = await pushTokens.remove(currentUser.id, token);
         return ok(removed ? "Push token removed." : "No matching push token found.", { removed });
       },
       {
@@ -211,23 +244,23 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
     )
 
     // Registered BEFORE /:id/read or the wildcard swallows "read-all".
-    .post("/read-all", ({ currentUser }) => {
-      const marked = notificationStore.markAllRead(currentUser.id);
+    .post("/read-all", async ({ currentUser }) => {
+      const marked = await store.markAllRead(currentUser.id);
       return ok(`${marked} notification(s) marked as read.`, { marked, unread_count: 0 });
     })
 
-    .post("/:id/read", ({ params, currentUser, set }) => {
+    .post("/:id/read", async ({ params, currentUser, set }) => {
       const id = Number(params.id);
       if (!Number.isInteger(id)) {
         set.status = 404;
         return fail("Notification not found.");
       }
-      const row = notificationStore.markRead(currentUser.id, id);
+      const row = await store.markRead(currentUser.id, id);
       if (!row) {
         set.status = 404;
         return fail("Notification not found.");
       }
-      return ok("Notification marked as read.", row, { unread_count: notificationStore.unreadCount(currentUser.id) });
+      return ok("Notification marked as read.", row, { unread_count: await store.unreadCount(currentUser.id) });
     }, { params: t.Object({ id: t.String() }) });
 }
 

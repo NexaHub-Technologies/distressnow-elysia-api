@@ -126,14 +126,41 @@ export class ReferralStore {
 
 export const referralStore = new ReferralStore();
 
+/**
+ * Store surface consumed by the route handlers. Returns are widened to
+ * `T | Promise<T>` so the DB-backed overlay (createDbReferralStore) can
+ * implement the same shape as the in-memory ReferralStore.
+ */
+export interface ReferralStoreLike {
+  register(
+    userId: string | null,
+    input: { code?: string | null; campaign?: string | null; metadata?: Record<string, unknown> },
+  ):
+    | { row: AttributionRow }
+    | { errors: string[] }
+    | Promise<{ row: AttributionRow } | { errors: string[] }>;
+  track(
+    userId: string | null,
+    input: { source?: string | null; campaign?: string | null; event?: string | null; attribution_id?: string | null; metadata?: Record<string, unknown> },
+  ):
+    | { row: AttributionRow }
+    | { errors: string[] }
+    | Promise<{ row: AttributionRow } | { errors: string[] }>;
+  reset(): void | Promise<void>;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 export interface ReferralsPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** Referral store (memory default; DB-backed in production). */
+  store?: ReferralStoreLike;
 }
 
 export function createReferralsPlugin(options: ReferralsPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.referrals ?? referralStore;
+
   return applyOptionalAuth(new Elysia({ prefix: "/referrals" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -141,10 +168,10 @@ export function createReferralsPlugin(options: ReferralsPluginOptions = {}) {
 
     .post(
       "/register",
-      ({ body, currentUser, set }) => {
+      async ({ body, currentUser, set }) => {
         // Pre-signup invite links: anonymous caller OR body.user_id (legacy).
         const userId = currentUser?.id ?? (body.user_id !== undefined && body.user_id !== null ? String(body.user_id) : null);
-        const result = referralStore.register(userId, {
+        const result = await store.register(userId, {
           code: body.code ?? null,
           campaign: body.campaign ?? null,
           metadata: body.metadata ?? {},
@@ -168,12 +195,12 @@ export function createReferralsPlugin(options: ReferralsPluginOptions = {}) {
 
     .post(
       "/attribution",
-      ({ body, currentUser, set }) => {
+      async ({ body, currentUser, set }) => {
         if (!currentUser) {
           set.status = 401;
           return fail("Unauthenticated.");
         }
-        const result = referralStore.track(currentUser.id, {
+        const result = await store.track(currentUser.id, {
           source: body.source ?? null,
           campaign: body.campaign ?? null,
           event: body.event ?? null,

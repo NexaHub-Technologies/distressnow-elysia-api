@@ -11,11 +11,8 @@
 // Mock mode: when EXPO_PUSH_ENABLED=false the send is logged and skipped
 // so local dev and CI never reach the network.
 //
-// The drizzle table below is the Postgres contract for future wiring;
-// the runtime currently uses the in-memory DeviceTokenStore seam
-// (swap `store` for drizzle queries without changing call sites).
-
-import { pgTable, serial, integer, varchar, timestamp } from "drizzle-orm/pg-core";
+// User ids are strings (see src/db/stores.ts). The DB table contract for
+// device_tokens lives in src/db/schema.ts.
 
 export const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 
@@ -27,17 +24,6 @@ export type PushPlatform = (typeof PUSH_PLATFORMS)[number];
 
 /** Expo rejects requests carrying more than 100 messages. */
 export const EXPO_CHUNK_SIZE = 100;
-
-// ── Drizzle contract (Postgres wiring seam) ────────────────────────────────
-
-export const deviceTokens = pgTable("device_tokens", {
-  id: serial("id").primaryKey(),
-  userId: integer("user_id").notNull(),
-  token: varchar("token", { length: 255 }).notNull().unique(),
-  platform: varchar("platform", { length: 10 }).notNull(),
-  deviceName: varchar("device_name", { length: 255 }),
-  lastUsedAt: timestamp("last_used_at"),
-});
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +37,7 @@ export interface PushNotification {
 
 export interface DeviceTokenRow {
   id: number;
-  userId: number;
+  userId: string;
   token: string;
   platform: PushPlatform;
   deviceName: string | null;
@@ -165,10 +151,28 @@ export function buildBroadcastPayload(input: {
 // ── Token registry ─────────────────────────────────────────────────────────
 
 export interface RegisterTokenInput {
-  userId: number;
+  userId: string;
   token: string;
   platform: string;
   deviceName?: string | null;
+}
+
+/**
+ * Token-registry surface shared by the notifications module and sendPush.
+ *
+ * Returns are widened to `T | Promise<T>` so the DB-backed overlay
+ * (createDbDeviceTokenStore) can implement the same shape as the in-memory
+ * DeviceTokenStore — route handlers uniformly `await`, which is a no-op for
+ * the synchronous memory store.
+ */
+export interface DeviceTokenRegistry {
+  register(input: RegisterTokenInput):
+    | { row: DeviceTokenRow | null; errors: string[] }
+    | Promise<{ row: DeviceTokenRow | null; errors: string[] }>;
+  remove(userId: string, token: string): boolean | Promise<boolean>;
+  prune(tokens: string[]): number | Promise<number>;
+  forUser(userId: string): DeviceTokenRow[] | Promise<DeviceTokenRow[]>;
+  reset(): void | Promise<void>;
 }
 
 export class DeviceTokenStore {
@@ -214,7 +218,7 @@ export class DeviceTokenStore {
   }
 
   /** Scoped delete — a user can only remove their own token. */
-  remove(userId: number, token: string): boolean {
+  remove(userId: string, token: string): boolean {
     const existing = this.rows.get(token);
     if (!existing || existing.userId !== userId) return false;
     this.rows.delete(token);
@@ -229,7 +233,7 @@ export class DeviceTokenStore {
     return n;
   }
 
-  forUser(userId: number): DeviceTokenRow[] {
+  forUser(userId: string): DeviceTokenRow[] {
     return [...this.rows.values()].filter((r) => r.userId === userId);
   }
 
@@ -252,7 +256,7 @@ export class DeviceTokenStore {
 export async function sendPush(
   notification: PushNotification,
   tokens: Array<DeviceTokenRow | string>,
-  opts?: { fetchImpl?: typeof fetch; store?: DeviceTokenStore },
+  opts?: { fetchImpl?: typeof fetch; store?: DeviceTokenRegistry },
 ): Promise<SendPushResult> {
   const messages = buildExpoMessages(notification, tokens);
   if (messages.length === 0) return { mocked: false, attempted: 0, sent: 0, pruned: [] };
@@ -291,7 +295,7 @@ export async function sendPush(
       const json = (await res.json()) as { data?: ExpoReceipt[] };
       const dead = extractDeadTokens(json.data ?? [], batchTokens);
       if (dead.length > 0) {
-        opts?.store?.prune(dead);
+        await opts?.store?.prune(dead);
         pruned.push(...dead);
         console.info("[Expo] Pruned unreachable device tokens", { count: dead.length });
       }

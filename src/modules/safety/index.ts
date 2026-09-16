@@ -113,14 +113,31 @@ export class SafetyStore {
 
 export const safetyStore = new SafetyStore();
 
+/**
+ * Store surface consumed by the route handlers. Returns are widened to
+ * `T | Promise<T>` so the DB-backed overlay (createDbSafetyStore) can
+ * implement the same shape as the in-memory SafetyStore.
+ */
+export interface SafetyStoreLike {
+  submit(
+    reporterId: string,
+    input: { target_type: string; target_id?: string | number | null; reason: string; details: string },
+  ): SafetyReportRow | Promise<SafetyReportRow>;
+  reset(): void | Promise<void>;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 export interface SafetyPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** Safety report store (memory default; DB-backed in production). */
+  store?: SafetyStoreLike;
 }
 
 export function createSafetyPlugin(options: SafetyPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.safety ?? safetyStore;
+
   return applyAuthGuard(new Elysia({ prefix: "/reports" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -128,13 +145,13 @@ export function createSafetyPlugin(options: SafetyPluginOptions = {}) {
 
     .post(
       "/safety",
-      ({ body, currentUser, set }) => {
+      async ({ body, currentUser, set }) => {
         const errors = validateSafetyReport(body);
         if (errors.length > 0) {
           set.status = 422;
           return fail("Safety report validation failed.", errors);
         }
-        const report = safetyStore.submit(currentUser.id, {
+        const report = await store.submit(currentUser.id, {
           target_type: body.target_type,
           target_id: body.target_id ?? null,
           reason: body.reason,

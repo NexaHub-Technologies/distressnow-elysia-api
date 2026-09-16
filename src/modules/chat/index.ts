@@ -93,7 +93,7 @@ export function participantKeyFor(a: string, b: string): string {
   return `${sorted[0]}-${sorted[1]}`;
 }
 
-function validateSyncItem(item: SyncMessageInput, senderId: string): string | null {
+export function validateSyncItem(item: SyncMessageInput, senderId: string): string | null {
   if (!item.conversation_id || item.conversation_id.length > 191) return "conversation_id is required (max 191 chars).";
   if (!item.client_message_id || item.client_message_id.length > 128) return "client_message_id is required (max 128 chars).";
   if (!item.receiver_id || item.receiver_id.length > 64) return "receiver_id is required.";
@@ -182,6 +182,22 @@ export class ChatStore {
     if (staff) return this.messages;
     return this.messages.filter((m) => m.senderId === userId || m.receiverId === userId);
   }
+
+  /**
+   * Populate the in-memory archive cache from durable storage. No-op in the
+   * memory store (its rows are already authoritative); the DB overlay uses
+   * it to hydrate before groupConversations / getHistory / read receipts.
+   */
+  hydrate(_userId: string, _staff: boolean = false): void {}
+
+  /**
+   * Mark every inbound message in the conversation read; returns the count.
+   * Same semantics as the exported pure function; the DB overlay persists
+   * the receipts as well as updating the in-memory cache.
+   */
+  markConversationRead(userId: string, conversationId: string): number {
+    return markConversationRead(this, userId, conversationId);
+  }
 }
 
 export function countUnread(messages: ChatMessageRow[], userId: string, conversationId?: string): number {
@@ -198,7 +214,7 @@ export function countUnread(messages: ChatMessageRow[], userId: string, conversa
  * each with its latest message, unread count and counterpart presence.
  */
 export function groupConversations(
-  store: ChatStore,
+  store: ChatStoreLike,
   userId: string,
   staff = false,
 ): ConversationSummary[] {
@@ -232,7 +248,7 @@ export function groupConversations(
 }
 
 export function getHistory(
-  store: ChatStore,
+  store: ChatStoreLike,
   userId: string,
   conversationId: string,
   staff: boolean,
@@ -251,7 +267,7 @@ export function getHistory(
   };
 }
 
-export function markConversationRead(store: ChatStore, userId: string, conversationId: string): number {
+export function markConversationRead(store: ChatStoreLike, userId: string, conversationId: string): number {
   const now = new Date().toISOString();
   let marked = 0;
   for (const m of store.messages) {
@@ -264,6 +280,28 @@ export function markConversationRead(store: ChatStore, userId: string, conversat
 }
 
 export const chatStore = new ChatStore();
+
+/**
+ * Store surface consumed by the route handlers. `messages`, `presence` and
+ * `visibleTo` stay in-memory on BOTH implementations (the DB overlay hydrates
+ * its message cache from chat_messages before the routes read it), while the
+ * mutating operations are widened to `T | Promise<T>` so the DB overlay can
+ * persist — handlers uniformly `await`, which is a no-op for the synchronous
+ * memory store.
+ */
+export interface ChatStoreLike {
+  messages: ChatMessageRow[];
+  presence: Map<string, PresenceRow>;
+  visibleTo(userId: string, staff: boolean): ChatMessageRow[];
+  syncBatch(senderId: string, items: SyncMessageInput[]):
+    | { created: ChatMessageRow[]; duplicates: ChatMessageRow[]; errors: Array<{ index: number; error: string }> }
+    | Promise<{ created: ChatMessageRow[]; duplicates: ChatMessageRow[]; errors: Array<{ index: number; error: string }> }>;
+  /** Populate the in-memory archive cache from durable storage (no-op in memory). */
+  hydrate(userId: string, staff?: boolean): void | Promise<void>;
+  /** Persist + apply read receipts for a conversation. */
+  markConversationRead(userId: string, conversationId: string): number | Promise<number>;
+  reset(): void | Promise<void>;
+}
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
@@ -279,9 +317,13 @@ const syncItemSchema = t.Object({
 export interface ChatPluginOptions {
   users?: UserStore;
   secret?: string;
+  /** Chat store (memory default; DB-backed in production). */
+  store?: ChatStoreLike;
 }
 
 export function createChatPlugin<const T extends AnyElysia = AnyElysia>(options: ChatPluginOptions = {}) {
+  const store = options.store ?? getDbStores()?.chat ?? chatStore;
+
   return applyAuthGuard(new Elysia({ prefix: "/chat" }), {
     secret: options.secret,
     users: options.users ?? getDbStores()?.users,
@@ -289,12 +331,12 @@ export function createChatPlugin<const T extends AnyElysia = AnyElysia>(options:
 
     .post(
       "/sync",
-      ({ body, currentUser, set }) => {
+      async ({ body, currentUser, set }) => {
         const messages = (body.messages as Array<Record<string, unknown>>).map((m) => ({
           ...m,
           receiver_id: String(m.receiver_id as number | string),
         }));
-        const result = chatStore.syncBatch(currentUser.id, messages as SyncMessageInput[]);
+        const result = await store.syncBatch(currentUser.id, messages as SyncMessageInput[]);
         if (result.errors.length > 0) {
           set.status = 422;
           return fail("Some messages failed validation.", result.errors);
@@ -314,7 +356,7 @@ export function createChatPlugin<const T extends AnyElysia = AnyElysia>(options:
       "/presence",
       ({ body, currentUser }) => {
         const lastSeen = body.last_seen ?? new Date().toISOString();
-        chatStore.presence.set(currentUser.id, { userId: currentUser.id, isOnline: body.is_online, lastSeen });
+        store.presence.set(currentUser.id, { userId: currentUser.id, isOnline: body.is_online, lastSeen });
         return ok("Presence updated.", { id: currentUser.id, is_online: body.is_online, last_seen: lastSeen });
       },
       {
@@ -326,17 +368,21 @@ export function createChatPlugin<const T extends AnyElysia = AnyElysia>(options:
     )
 
     // Static segment registered BEFORE /:conversationId or the wildcard swallows it.
-    .get("/conversations", ({ currentUser }) => {
-      const conversations = groupConversations(chatStore, currentUser.id, isStaff(currentUser));
+    .get("/conversations", async ({ currentUser }) => {
+      const staff = isStaff(currentUser);
+      await store.hydrate(currentUser.id, staff);
+      const conversations = groupConversations(store, currentUser.id, staff);
       return ok("Conversations retrieved.", conversations);
     })
 
     .get(
       "/:conversationId",
-      ({ params, query, currentUser }) => {
+      async ({ params, query, currentUser }) => {
+        const staff = isStaff(currentUser);
+        await store.hydrate(currentUser.id, staff);
         const limit = query.limit !== undefined ? Number(query.limit) : 30;
         const before = query.before !== undefined ? Number(query.before) : undefined;
-        const { messages, unreadCount, hasMore } = getHistory(chatStore, currentUser.id, params.conversationId, isStaff(currentUser), {
+        const { messages, unreadCount, hasMore } = getHistory(store, currentUser.id, params.conversationId, staff, {
           limit: Number.isFinite(limit) ? limit : 30,
           before: before !== undefined && Number.isFinite(before) ? before : undefined,
         });
@@ -354,8 +400,8 @@ export function createChatPlugin<const T extends AnyElysia = AnyElysia>(options:
 
     .post(
       "/:conversationId/read",
-      ({ params, currentUser }) => {
-        const marked = markConversationRead(chatStore, currentUser.id, params.conversationId);
+      async ({ params, currentUser }) => {
+        const marked = await store.markConversationRead(currentUser.id, params.conversationId);
         return ok("Conversation marked as read.", { marked, unread_count: 0 });
       },
       { params: t.Object({ conversationId: t.String() }) },

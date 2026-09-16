@@ -84,10 +84,13 @@ export interface CreateTransactionInput {
 }
 
 export interface TransactionStore {
-  findByReference(reference: string): TransactionRecord | null;
-  create(input: CreateTransactionInput): TransactionRecord;
-  update(reference: string, patch: Partial<TransactionRecord>): TransactionRecord | null;
-  reset(): void;
+  findByReference(reference: string): TransactionRecord | null | Promise<TransactionRecord | null>;
+  create(input: CreateTransactionInput): TransactionRecord | Promise<TransactionRecord>;
+  update(
+    reference: string,
+    patch: Partial<TransactionRecord>,
+  ): TransactionRecord | null | Promise<TransactionRecord | null>;
+  reset(): void | Promise<void>;
 }
 
 export class MemoryTransactionStore implements TransactionStore {
@@ -215,7 +218,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
         const amountKobo = Math.round(body.amount * 100);
         const reference = generateReference();
 
-        const transaction = store.create({
+        const transaction = await store.create({
           userId: user.id,
           bookingId: body.booking_id ?? null,
           reference,
@@ -244,7 +247,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
             transaction: serializeTransaction(transaction),
           }));
         } catch (err) {
-          store.update(reference, {
+          await store.update(reference, {
             status: "failed",
             gatewayResponse: (err as Error).message,
           });
@@ -259,7 +262,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
       async ({ body, currentUser, status }) => {
         if (!currentUser) return status(401, fail("Unauthenticated."));
 
-        const transaction = store.findByReference(body.reference);
+        const transaction = await store.findByReference(body.reference);
         if (!transaction) return status(404, fail("Transaction not found."));
 
         if (transaction.status !== "pending") {
@@ -272,7 +275,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
           const data = await verifyTransaction(body.reference);
           const mapped = mapGatewayStatus(data.status);
 
-          const updated = store.update(body.reference, {
+          const updated = await store.update(body.reference, {
             status: mapped,
             channel: (data.channel as string | null | undefined) ?? null,
             gatewayResponse: (data.gateway_response as string | null | undefined) ?? null,
@@ -293,7 +296,7 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
       { body: VerifyBody },
     )
 
-    .post("/webhook", ({ body, headers, status }) => {
+    .post("/webhook", async ({ body, headers, status }) => {
       // Raw text body is required: the HMAC must cover the exact bytes
       // Paystack sent (see `parse: "text"` below).
       const rawText = typeof body === "string" ? body : JSON.stringify(body ?? "");
@@ -315,9 +318,9 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
         const reference =
           typeof event.data?.reference === "string" ? event.data.reference : null;
         if (reference) {
-          const transaction = store.findByReference(reference);
+          const transaction = await store.findByReference(reference);
           if (transaction && transaction.status === "pending") {
-            store.update(reference, {
+            await store.update(reference, {
               status: "success",
               channel: typeof event.data?.channel === "string" ? event.data.channel : null,
               gatewayResponse:

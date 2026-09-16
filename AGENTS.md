@@ -54,7 +54,7 @@ External services:
 
 - **Strict rule**: unit/feature tests exist for every new feature and pass cleanly
   before committing.
-- **Run tests**: `bun test` (131 tests / 6 files: auth, kyc, marketplace, engagement,
+- **Run tests**: `bun test` (137 tests / 6 files: auth, kyc, marketplace, engagement,
   payments, admin). Single file: `bun test tests/auth.test.ts`.
 - **Typecheck**: `bunx tsc --noEmit` must pass before committing.
 - **Test style**: `bun:test` against the exported `app` from `src/index.ts`

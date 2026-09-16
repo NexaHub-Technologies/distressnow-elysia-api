@@ -333,12 +333,17 @@ describe("engagement routes (JWT auth)", () => {
     userAId = a.id;
     authA = { authorization: `Bearer ${await mintJwtToken(SECRET, a.id)}` };
     authB = { authorization: `Bearer ${await mintJwtToken(SECRET, b.id)}` };
-    chatApp = createChatPlugin({ users, secret: SECRET });
-    supportApp = createSupportPlugin({ users, secret: SECRET });
-    notificationsApp = createNotificationsPlugin({ users, secret: SECRET });
-    advertsApp = createAdvertsPlugin({ users, secret: SECRET });
-    referralsApp = createReferralsPlugin({ users, secret: SECRET });
-    safetyApp = createSafetyPlugin({ users, secret: SECRET });
+    chatApp = createChatPlugin({ users, secret: SECRET, store: chatStore });
+    supportApp = createSupportPlugin({ users, secret: SECRET, store: supportStore });
+    notificationsApp = createNotificationsPlugin({
+      users,
+      secret: SECRET,
+      store: notificationStore,
+      pushTokens: pushTokenStore,
+    });
+    advertsApp = createAdvertsPlugin({ users, secret: SECRET, store: advertStore });
+    referralsApp = createReferralsPlugin({ users, secret: SECRET, store: referralStore });
+    safetyApp = createSafetyPlugin({ users, secret: SECRET, store: safetyStore });
   });
 
   test("chat: unauthenticated requests are rejected", async () => {
@@ -391,8 +396,8 @@ describe("engagement routes (JWT auth)", () => {
   });
 
   test("notifications: feed carries account-wide unread_count; read-all zeroes it", async () => {
-    await sendNotification({ userId: userAId, type: "support_reply", title: "T1", body: "B1" });
-    await sendNotification({ userId: userAId, type: "support_reply", title: "T2", body: "B2" });
+    await sendNotification({ userId: userAId, type: "support_reply", title: "T1", body: "B1" }, { store: notificationStore, pushTokens: pushTokenStore });
+    await sendNotification({ userId: userAId, type: "support_reply", title: "T2", body: "B2" }, { store: notificationStore, pushTokens: pushTokenStore });
     const feed = await handle(notificationsApp, json("GET", "/notifications?per_page=1", undefined, authA));
     const body = feed.data as { data: unknown[]; meta: { unread_count: number; total: number } };
     expect(body.data).toHaveLength(1);

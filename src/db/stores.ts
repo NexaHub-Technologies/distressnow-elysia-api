@@ -50,6 +50,16 @@ import {
 } from "../services/termii";
 import { generateOtpCode, normalizeEmail, normalizePhone, nowIso } from "../utils/phone";
 import { env } from "../env";
+import {
+  createDbTransactionStore,
+  createDbNotificationStore,
+  createDbDeviceTokenStore,
+  createDbSupportStore,
+  createDbAdvertStore,
+  createDbReferralStore,
+  createDbSafetyStore,
+  createDbChatStore,
+} from "./stores-engagement";
 
 // Type-only imports — erased at runtime, so stores.ts never participates in a
 // runtime import cycle with the modules that consume these factories.
@@ -60,6 +70,15 @@ import type {
 } from "../modules/auth/index";
 import type { KycDocument, KycRecord, KycStatus } from "../modules/kyc/index";
 import type { ProviderApplication, SellerApplication } from "../modules/applications/index";
+
+import type { TransactionStore } from "../modules/payments/index";
+import type { NotificationStoreLike } from "../modules/notifications/index";
+import type { DeviceTokenRegistry } from "../services/push";
+import type { SupportStoreLike } from "../modules/support/index";
+import type { AdvertStoreLike } from "../modules/adverts/index";
+import type { ReferralStoreLike } from "../modules/referrals/index";
+import type { SafetyStoreLike } from "../modules/safety/index";
+import type { ChatStoreLike } from "../modules/chat/index";
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -767,6 +786,14 @@ export interface DbStores {
   kyc: DbKycStore;
   sellers: DbSellerApplicationStore;
   providers: DbProviderApplicationStore;
+  transactions: TransactionStore;
+  notifications: NotificationStoreLike;
+  deviceTokens: DeviceTokenRegistry;
+  support: SupportStoreLike;
+  adverts: AdvertStoreLike;
+  referrals: ReferralStoreLike;
+  safety: SafetyStoreLike;
+  chat: ChatStoreLike;
 }
 
 const PROBE_TIMEOUT_MS = 3000;
@@ -829,6 +856,14 @@ export function getDbStores(): DbStores | null {
       kyc: createDbKycStore(),
       sellers: createDbSellerApplicationStore(),
       providers: createDbProviderApplicationStore(),
+      transactions: createDbTransactionStore(),
+      notifications: createDbNotificationStore(),
+      deviceTokens: createDbDeviceTokenStore(),
+      support: createDbSupportStore(),
+      adverts: createDbAdvertStore(),
+      referrals: createDbReferralStore(),
+      safety: createDbSafetyStore(),
+      chat: createDbChatStore(),
     };
   }
   return cachedDbStores;
