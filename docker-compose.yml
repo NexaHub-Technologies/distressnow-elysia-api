@@ -11,6 +11,14 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # The API probes Postgres once at boot and silently falls back to
+    # in-memory stores when unreachable — never let it start first.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d distressnow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   api:
     image: oven/bun:1
@@ -19,7 +27,8 @@ services:
     working_dir: /app
     command: bun run --watch src/index.ts
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/distressnow
       PORT: 3000
