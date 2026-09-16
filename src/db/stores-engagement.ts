@@ -65,7 +65,8 @@ export function toIso(value: Date | string | null | undefined): string | null {
   return value instanceof Date ? value.toISOString() : value;
 }
 
-function toDate(value: string | number | Date | null | undefined): Date | null {
+/** Date for an ISO/string/epoch value (null passthrough). */
+export function toDate(value: string | number | Date | null | undefined): Date | null {
   if (value == null) return null;
   return value instanceof Date ? value : new Date(value);
 }
@@ -396,6 +397,18 @@ export function createDbDeviceTokenStore(): DeviceTokenRegistry {
         .from(deviceTokensTable)
         .where(eq(deviceTokensTable.userId, numeric))
         .orderBy(desc(deviceTokensTable.id));
+      return rows.map(rowToToken);
+    },
+
+    async forUsers(userIds: string[]): Promise<DeviceTokenRow[]> {
+      const numerics = userIds
+        .map((id) => numericUserId(id))
+        .filter((n): n is number => n != null);
+      if (numerics.length === 0) return [];
+      const rows = await db
+        .select()
+        .from(deviceTokensTable)
+        .where(inArray(deviceTokensTable.userId, numerics));
       return rows.map(rowToToken);
     },
 

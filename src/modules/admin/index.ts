@@ -30,6 +30,7 @@
  */
 import { Elysia, t } from "elysia";
 import { applyAuthGuard, type UserStore } from "../auth/index";
+import { pushTokenStore } from "../notifications/index";
 import { dbModeActive, getDbStores } from "../../db/stores";
 import {
   createDbAdvertsAdminQueue,
@@ -40,6 +41,10 @@ import {
   createDbTicketsAdminQueue,
   createDbUsersAdminQueue,
 } from "../../db/stores-admin";
+import { BROADCAST_DISPATCH_CAP, dispatchBroadcast } from "../../services/broadcast";
+import { sendPush, type DeviceTokenRegistry } from "../../services/push";
+import { sendSms } from "../../services/termii";
+import { send as sendEmail } from "../../services/email";
 import { newId, nowIso } from "../../utils/phone";
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
@@ -136,6 +141,8 @@ export interface AdminManagedUser {
   id: string;
   name: string;
   email: string | null;
+  /** Optional: only populated where the source tracks it (needed for SMS fan-out). */
+  phone?: string | null;
   roles: string[];
   state: string | null;
   isSuspended: boolean;
@@ -235,7 +242,20 @@ export interface BroadcastItem {
   channels: string[];
   recipientCount: number;
   status: string;
+  sentCount: number;
+  failureReason: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
   createdAt: string;
+}
+
+/** Lifecycle patch for a queued broadcast (sending → sent/failed). */
+export interface BroadcastStatusPatch {
+  status: "sending" | "sent" | "failed";
+  sentCount?: number;
+  failureReason?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
 function slugify(name: string): string {
@@ -419,7 +439,22 @@ export interface BroadcastsAdminQueueLike {
     state?: string,
     userIds?: string[],
   ): number | Promise<number>;
+  /**
+   * Recipient user ids for fan-out, newest first, hard-capped by `limit`.
+   * The route caps the audience before dispatch; the limit is the backstop.
+   */
+  resolveRecipientIds(
+    audience: string,
+    role?: string,
+    state?: string,
+    userIds?: string[],
+    limit?: number,
+  ): string[] | Promise<string[]>;
   create(item: BroadcastItem): BroadcastItem | Promise<BroadcastItem>;
+  updateStatus(
+    id: string,
+    patch: BroadcastStatusPatch,
+  ): BroadcastItem | null | Promise<BroadcastItem | null>;
   reset(): void | Promise<void>;
 }
 
@@ -506,8 +541,50 @@ export class MemoryBroadcastsAdminQueue implements BroadcastsAdminQueueLike {
     return this.store.recipientCount(audience, role, state, userIds);
   }
 
+  resolveRecipientIds(
+    audience: string,
+    role?: string,
+    state?: string,
+    userIds?: string[],
+    limit: number = BROADCAST_DISPATCH_CAP,
+  ): string[] {
+    const users = [...this.store.users.values()].filter((user) => !user.isSuspended);
+    let picked: AdminManagedUser[];
+    switch (audience) {
+      case "role":
+        picked = role ? users.filter((user) => user.roles.includes(role)) : [];
+        break;
+      case "state":
+        picked = state ? users.filter((user) => user.state === state) : [];
+        break;
+      case "users":
+        picked = (userIds ?? [])
+          .slice(0, 1000)
+          .map((id) => this.store.users.get(id))
+          .filter((user): user is AdminManagedUser => !!user && !user.isSuspended);
+        break;
+      default:
+        picked = users;
+    }
+    return picked
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((user) => user.id);
+  }
+
   create(item: BroadcastItem): BroadcastItem {
     this.store.broadcasts.push(item);
+    return item;
+  }
+
+  updateStatus(id: string, patch: BroadcastStatusPatch): BroadcastItem | null {
+    const item = this.store.broadcasts.find((b) => b.id === id);
+    if (!item) return null;
+    item.status = patch.status;
+    if (patch.sentCount !== undefined) item.sentCount = patch.sentCount;
+    if (patch.failureReason !== undefined) item.failureReason = patch.failureReason;
+    if (patch.startedAt !== undefined) item.startedAt = patch.startedAt;
+    if (patch.completedAt !== undefined) item.completedAt = patch.completedAt;
     return item;
   }
 
@@ -541,6 +618,10 @@ export interface RoleApplicationsAdminQueueLike {
 export interface UsersAdminQueueLike {
   list(role?: string, search?: string): AdminManagedUser[] | Promise<AdminManagedUser[]>;
   get(id: string): AdminManagedUser | undefined | Promise<AdminManagedUser | undefined>;
+  /** Batch contact lookup for broadcast fan-out (one pass, not N get() calls). */
+  contacts(
+    userIds: string[],
+  ): Array<{ userId: string; phone: string | null; email: string | null }> | Promise<Array<{ userId: string; phone: string | null; email: string | null }>>;
   suspend(id: string, reason: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
   unsuspend(id: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
   grantRole(id: string, role: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
@@ -644,6 +725,15 @@ export class MemoryUsersAdminQueue implements UsersAdminQueueLike {
 
   get(id: string): AdminManagedUser | undefined {
     return this.users.get(id);
+  }
+
+  contacts(
+    userIds: string[],
+  ): Array<{ userId: string; phone: string | null; email: string | null }> {
+    const wanted = new Set(userIds);
+    return [...this.users.values()]
+      .filter((user) => wanted.has(user.id))
+      .map((user) => ({ userId: user.id, phone: user.phone ?? null, email: user.email }));
   }
 
   suspend(id: string, reason: string): AdminManagedUser | null {
@@ -830,6 +920,8 @@ export interface AdminPluginOptions {
   providersQueue?: RoleApplicationsAdminQueueLike;
   /** Managed-users queue (memory AdminStore map by default; `users` in production). */
   usersQueue?: UsersAdminQueueLike;
+  /** Push-token registry for broadcast fan-out (DB `device_tokens` in production). */
+  pushTokens?: DeviceTokenRegistry;
 }
 
 const STAFF = "admin|verifier";
@@ -860,7 +952,78 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       : new MemoryRoleApplicationsAdminQueue(store.providerApps, store.users, "provider"));
   const usersQueue =
     options.usersQueue ?? (db ? createDbUsersAdminQueue() : new MemoryUsersAdminQueue(store.users));
+  const pushTokens = options.pushTokens ?? (db ? db.deviceTokens : pushTokenStore);
   const logs = options.logs ?? (db ? db.adminLogs : adminLogStore);
+
+  interface BroadcastDispatchJob {
+    broadcastId: string;
+    title: string;
+    body: string;
+    type: string;
+    channels: string[];
+    audience: string;
+    role?: string;
+    state?: string;
+    userIds?: string[];
+  }
+
+  /**
+   * Background fan-out for a queued broadcast. Runs detached from the
+   * request (the 202 acknowledges queueing); delivery lands on the
+   * broadcast row via sending → sent/failed. Never throws — every failure
+   * is recorded on the row so a stuck "sending" row always means the
+   * process died mid-dispatch, never a swallowed error.
+   */
+  async function finalizeBroadcastDispatch(job: BroadcastDispatchJob): Promise<void> {
+    try {
+      const ids = await broadcastsQueue.resolveRecipientIds(
+        job.audience,
+        job.role,
+        job.state,
+        job.userIds,
+        BROADCAST_DISPATCH_CAP,
+      );
+      const result = await dispatchBroadcast(
+        { title: job.title, body: job.body, type: job.type },
+        job.channels,
+        {
+          recipientIds: ids,
+          tokensForUsers: async (uids) => (await pushTokens.forUsers(uids)).map((r) => r.token),
+          contactsForUsers: (uids) => usersQueue.contacts(uids),
+          pushSender: {
+            send: async (notification, tokens) => {
+              const numeric = Number(job.broadcastId);
+              const res = await sendPush(
+                {
+                  id: Number.isSafeInteger(numeric) ? numeric : job.broadcastId,
+                  type: job.type,
+                  title: notification.title,
+                  body: notification.body,
+                },
+                tokens,
+                { store: pushTokens },
+              );
+              return { sent: res.sent };
+            },
+          },
+          smsSender: { send: (phone, message) => sendSms(phone, message) },
+          emailSender: { send: (to, subject, text) => sendEmail({ to, subject, text }) },
+        },
+      );
+      await broadcastsQueue.updateStatus(job.broadcastId, {
+        status: result.sentCount > 0 ? "sent" : "failed",
+        sentCount: result.sentCount,
+        failureReason: result.failureReason,
+        completedAt: nowIso(),
+      });
+    } catch (err) {
+      await broadcastsQueue.updateStatus(job.broadcastId, {
+        status: "failed",
+        failureReason: (err as Error).message,
+        completedAt: nowIso(),
+      });
+    }
+  }
 
   return (
     applyAuthGuard(new Elysia({ prefix: "/api/v1/admin" }), {
@@ -1392,6 +1555,21 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           );
         }
 
+        // Dispatch backstop: push/email fan-out is bounded per broadcast so
+        // a huge audience can't turn the worker into a multi-minute request.
+        if (
+          recipientCount > BROADCAST_DISPATCH_CAP &&
+          channels.some((c: string) => c === "push" || c === "email")
+        ) {
+          return status(
+            422,
+            fail(
+              `This segment matches ${recipientCount} recipients, above the per-broadcast ` +
+                `dispatch cap of ${BROADCAST_DISPATCH_CAP}. Narrow the audience.`,
+            ),
+          );
+        }
+
         // NOTE: throttle mirrors the throttle:3,60 route middleware in the
         // reference. In-memory here — move to Redis/Elysia rate-limit at deploy.
         if (!store.checkBroadcastThrottle(adminId)) {
@@ -1408,9 +1586,15 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           channels,
           recipientCount,
           status: "queued",
+          sentCount: 0,
+          failureReason: null,
+          startedAt: null,
+          completedAt: null,
           createdAt: nowIso(),
         };
-        await broadcastsQueue.create(broadcast);
+        const created = await broadcastsQueue.create(broadcast);
+        const startedAt = nowIso();
+        await broadcastsQueue.updateStatus(created.id, { status: "sending", startedAt });
         await logs.log({
           adminId,
           action: "broadcast.queued",
@@ -1418,8 +1602,34 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           targetId: broadcast.id,
           details: { audience, recipientCount, channels, type: broadcast.type },
         });
-        // TODO(db): dispatch the queued BroadcastNotification job.
-        return status(202, ok(`Broadcast queued for ${recipientCount} recipients.`, { broadcast }));
+        // Detached fan-out: the 202 acknowledges queueing while delivery
+        // continues in the background and lands on the broadcast row.
+        void Promise.resolve()
+          .then(() =>
+            finalizeBroadcastDispatch({
+              broadcastId: created.id,
+              title: body.title,
+              body: body.body,
+              type: body.type ?? "announcement",
+              channels,
+              audience,
+              role: body.role,
+              state: body.state,
+              userIds: body.user_ids,
+            }),
+          )
+          .catch((err: unknown) =>
+            console.error("[broadcast] dispatch failed", {
+              broadcastId: created.id,
+              error: (err as Error).message,
+            }),
+          );
+        return status(
+          202,
+          ok(`Broadcast queued for ${recipientCount} recipients.`, {
+            broadcast: { ...created, status: "sending" as const, startedAt },
+          }),
+        );
       }, { body: BroadcastBody })
   );
 }

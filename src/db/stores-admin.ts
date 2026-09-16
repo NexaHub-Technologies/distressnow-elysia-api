@@ -32,7 +32,7 @@ import {
   ticketStatusEnum,
   users,
 } from "./schema";
-import { numericUserId, toIso } from "./stores-engagement";
+import { numericUserId, toDate, toIso } from "./stores-engagement";
 import { nowIso } from "../utils/phone";
 
 // Type-only imports — erased at runtime, so these factories never create a
@@ -60,6 +60,11 @@ const MODEL_TYPE = "App\\Models\\User";
 /** Guard enum columns so a bogus filter can't 500 on a Postgres enum. */
 function validEnum(values: readonly string[], value: string | undefined): value is string {
   return value !== undefined && values.includes(value);
+}
+
+/** Escape LIKE wildcards so user search input matches literally. */
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
 /** Role names for one user (spatie shape, same MODEL_TYPE as the auth UserStore). */
@@ -213,15 +218,23 @@ export function createDbAdvertsAdminQueue(): AdvertsAdminQueueLike {
     },
 
     async stats() {
+      // SQL aggregates — the table scan stays in Postgres instead of
+      // hydrating every row into JS (the old memory-style loop).
       const rows = await db
-        .select({ status: adverts.status, amount: adverts.amountPaid })
-        .from(adverts);
-      const out = { total: rows.length, active: 0, pending: 0, expired: 0, revenue: 0 };
+        .select({
+          status: adverts.status,
+          count: sql<number>`count(*)::int`,
+          revenue: sql<number>`coalesce(sum(${adverts.amountPaid}), 0)::float8`,
+        })
+        .from(adverts)
+        .groupBy(adverts.status);
+      const out = { total: 0, active: 0, pending: 0, expired: 0, revenue: 0 };
       for (const row of rows) {
-        if (row.status === "active") out.active++;
-        else if (row.status === "pending") out.pending++;
-        else if (row.status === "expired") out.expired++;
-        out.revenue += Number(row.amount);
+        out.total += row.count;
+        if (row.status === "active") out.active += row.count;
+        else if (row.status === "pending") out.pending += row.count;
+        else if (row.status === "expired") out.expired += row.count;
+        out.revenue += row.revenue;
       }
       out.revenue = Math.round(out.revenue * 100) / 100;
       return out;
@@ -347,6 +360,10 @@ export function createDbBroadcastsAdminQueue(): BroadcastsAdminQueueLike {
       channels: (row.channels as string[] | null) ?? ["push"],
       recipientCount: row.recipientCount,
       status: row.status,
+      sentCount: row.sentCount,
+      failureReason: row.failureReason,
+      startedAt: toIso(row.startedAt),
+      completedAt: toIso(row.completedAt),
       createdAt: toIso(row.createdAt) ?? nowIso(),
     };
   }
@@ -395,6 +412,60 @@ export function createDbBroadcastsAdminQueue(): BroadcastsAdminQueueLike {
       }
     },
 
+    async resolveRecipientIds(audience, role, state, userIds, limit = 5000) {
+      const cap = Math.max(1, Math.min(limit, 5000));
+      switch (audience) {
+        case "role": {
+          if (!role) return [];
+          const rows = await db
+            .select({ id: users.id })
+            .from(users)
+            .innerJoin(
+              modelHasRoles,
+              and(eq(modelHasRoles.modelId, users.id), eq(modelHasRoles.modelType, MODEL_TYPE)),
+            )
+            .innerJoin(roles, eq(modelHasRoles.roleId, roles.id))
+            .where(and(eq(roles.name, role), eq(users.isSuspended, false)))
+            .orderBy(desc(users.createdAt))
+            .limit(cap);
+          return rows.map((r) => String(r.id));
+        }
+        case "state": {
+          if (!state) return [];
+          const rows = await db
+            .select({ id: users.id })
+            .from(users)
+            .where(and(eq(users.locationState, state), eq(users.isSuspended, false)))
+            .orderBy(desc(users.createdAt))
+            .limit(cap);
+          return rows.map((r) => String(r.id));
+        }
+        case "users": {
+          const wanted = [...new Set(userIds ?? [])].slice(0, Math.min(cap, 1000));
+          const numerics = wanted
+            .map((id) => numericUserId(id))
+            .filter((n): n is number => n != null);
+          if (numerics.length === 0) return [];
+          const rows = await db
+            .select({ id: users.id })
+            .from(users)
+            .where(and(inArray(users.id, numerics), eq(users.isSuspended, false)));
+          const live = new Set(rows.map((r) => r.id));
+          // Preserve request order, drop unknown/suspended ids.
+          return numerics.filter((n) => live.has(n)).map(String);
+        }
+        default: {
+          const rows = await db
+            .select({ id: users.id })
+            .from(users)
+            .where(eq(users.isSuspended, false))
+            .orderBy(desc(users.createdAt))
+            .limit(cap);
+          return rows.map((r) => String(r.id));
+        }
+      }
+    },
+
     async create(item) {
       const adminNum = numericUserId(item.adminId);
       if (adminNum == null) {
@@ -415,6 +486,24 @@ export function createDbBroadcastsAdminQueue(): BroadcastsAdminQueueLike {
         })
         .returning();
       return row ? rowToItem(row) : item;
+    },
+
+    async updateStatus(id, patch) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(notificationBroadcasts)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          status: patch.status as any,
+          ...(patch.sentCount !== undefined ? { sentCount: patch.sentCount } : {}),
+          ...(patch.failureReason !== undefined ? { failureReason: patch.failureReason } : {}),
+          ...(patch.startedAt !== undefined ? { startedAt: toDate(patch.startedAt) } : {}),
+          ...(patch.completedAt !== undefined ? { completedAt: toDate(patch.completedAt) } : {}),
+        })
+        .where(eq(notificationBroadcasts.id, numeric))
+        .returning();
+      return row ? rowToItem(row) : null;
     },
 
     /** No-op for parity: DB rows persist across requests (tests use memory). */
@@ -621,7 +710,7 @@ export function createDbUsersAdminQueue(): UsersAdminQueueLike {
       const needle = search?.trim();
       const filters: SQL[] = [];
       if (needle) {
-        const pattern = `%${needle}%`;
+        const pattern = `%${escapeLike(needle)}%`;
         const emailMatch = ilike(users.email, pattern);
         const either = emailMatch
           ? or(ilike(users.name, pattern), emailMatch)
@@ -673,6 +762,18 @@ export function createDbUsersAdminQueue(): UsersAdminQueueLike {
       if (numeric == null) return undefined;
       const [row] = await db.select().from(users).where(eq(users.id, numeric)).limit(1);
       return row ? rowToUser(row) : undefined;
+    },
+
+    async contacts(userIds) {
+      const numerics = [...new Set(userIds)]
+        .map((id) => numericUserId(id))
+        .filter((n): n is number => n != null);
+      if (numerics.length === 0) return [];
+      const rows = await db
+        .select({ id: users.id, phone: users.phone, email: users.email })
+        .from(users)
+        .where(inArray(users.id, numerics));
+      return rows.map((r) => ({ userId: String(r.id), phone: r.phone, email: r.email }));
     },
 
     async suspend(id, reason) {

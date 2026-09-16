@@ -172,6 +172,12 @@ export interface DeviceTokenRegistry {
   remove(userId: string, token: string): boolean | Promise<boolean>;
   prune(tokens: string[]): number | Promise<number>;
   forUser(userId: string): DeviceTokenRow[] | Promise<DeviceTokenRow[]>;
+  /**
+   * Batch token lookup for broadcast fan-out (one query, not N per-user
+   * round trips — the per-recipient loop would not survive a large
+   * audience).
+   */
+  forUsers(userIds: string[]): DeviceTokenRow[] | Promise<DeviceTokenRow[]>;
   reset(): void | Promise<void>;
 }
 
@@ -235,6 +241,11 @@ export class DeviceTokenStore {
 
   forUser(userId: string): DeviceTokenRow[] {
     return [...this.rows.values()].filter((r) => r.userId === userId);
+  }
+
+  forUsers(userIds: string[]): DeviceTokenRow[] {
+    const wanted = new Set(userIds);
+    return [...this.rows.values()].filter((r) => wanted.has(r.userId));
   }
 
   count(): number {
