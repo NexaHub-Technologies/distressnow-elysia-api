@@ -18,7 +18,8 @@
  * signature instead.
  *
  * Persistence: in-memory TransactionStore behind a small interface.
- * TODO(db): swap MemoryTransactionStore for a drizzle-backed implementation
+ * Production uses the drizzle-backed overlay (createDbTransactionStore over
+ * `transactions`) unless an explicit store is injected (tests).
  * over the `transactions` table (reference, user_id, booking_id, amount,
  * amount_kobo, status, channel, gateway_response, authorization, metadata,
  * paid_at) — no route code needs to change.
@@ -202,7 +203,7 @@ export interface PaymentsPluginOptions {
 }
 
 export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
-  const store = options.store ?? transactionStore;
+  const store = options.store ?? getDbStores()?.transactions ?? transactionStore;
 
   return applyOptionalAuth(new Elysia({ prefix: "/api/v1/payments" }), {
     secret: options.secret,

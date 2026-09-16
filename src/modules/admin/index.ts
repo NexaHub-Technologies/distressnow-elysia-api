@@ -20,10 +20,13 @@
  * return 401/403 through the same envelope.
  *
  * Persistence: in-memory AdminStore behind a small class with reset().
- * TODO(db): back each collection with drizzle (users, kyc_profiles,
- * seller_applications, provider_applications, markets, support_tickets,
- * contact_updates, adverts, listings, notification_broadcasts, admin_logs)
- * and record an admin_logs row per mutating action.
+ * DB-backed review queues live in src/db/stores-admin.ts and are selected
+ * when no explicit store is injected AND DATABASE_URL is reachable (users,
+ * kyc_profiles, seller_applications, provider_applications, support_tickets,
+ * adverts, notification_broadcasts, admin_logs). Every mutating action
+ * records an admin_logs row.
+ * TODO(db): back the remaining collections with drizzle (markets, listings,
+ * contact_updates).
  */
 import { Elysia, t } from "elysia";
 import { applyAuthGuard, type UserStore } from "../auth/index";
@@ -31,7 +34,11 @@ import { dbModeActive, getDbStores } from "../../db/stores";
 import {
   createDbAdvertsAdminQueue,
   createDbBroadcastsAdminQueue,
+  createDbKycAdminQueue,
+  createDbProviderApplicationsAdminQueue,
+  createDbSellerApplicationsAdminQueue,
   createDbTicketsAdminQueue,
+  createDbUsersAdminQueue,
 } from "../../db/stores-admin";
 import { newId, nowIso } from "../../utils/phone";
 
@@ -507,6 +514,171 @@ export class MemoryBroadcastsAdminQueue implements BroadcastsAdminQueueLike {
   reset(): void {}
 }
 
+// ── Admin identity queue seams (users / KYC / role applications) ───────────
+
+export interface KycAdminQueueLike {
+  list(status?: string, tier?: number): KycReviewItem[] | Promise<KycReviewItem[]>;
+  approve(id: string, reviewerId: string): KycReviewItem | null | Promise<KycReviewItem | null>;
+  reject(
+    id: string,
+    reason: string,
+    reviewerId: string,
+  ): KycReviewItem | null | Promise<KycReviewItem | null>;
+  reset(): void | Promise<void>;
+}
+
+export interface RoleApplicationsAdminQueueLike {
+  list(): ApplicationItem[] | Promise<ApplicationItem[]>;
+  approve(id: string, reviewerId: string): ApplicationItem | null | Promise<ApplicationItem | null>;
+  decline(
+    id: string,
+    reason: string,
+    reviewerId: string,
+  ): ApplicationItem | null | Promise<ApplicationItem | null>;
+  reset(): void | Promise<void>;
+}
+
+export interface UsersAdminQueueLike {
+  list(role?: string, search?: string): AdminManagedUser[] | Promise<AdminManagedUser[]>;
+  get(id: string): AdminManagedUser | undefined | Promise<AdminManagedUser | undefined>;
+  suspend(id: string, reason: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
+  unsuspend(id: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
+  grantRole(id: string, role: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
+  revokeRole(id: string, role: string): AdminManagedUser | null | Promise<AdminManagedUser | null>;
+  reset(): void | Promise<void>;
+}
+
+/**
+ * Memory identity adapters over an AdminStore's collections. Mutations hit
+ * the shared maps in place so test assertions on `store.kyc`,
+ * `store.sellerApps` / `store.providerApps` (incl. the role grant on
+ * `store.users`) and `store.users` stay green.
+ */
+export class MemoryKycAdminQueue implements KycAdminQueueLike {
+  constructor(readonly kyc: Map<string, KycReviewItem>) {}
+
+  list(status?: string, tier?: number): KycReviewItem[] {
+    return [...this.kyc.values()]
+      .filter((item) => !status || item.status === status)
+      .filter((item) => tier === undefined || item.tier === tier)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  approve(id: string, reviewerId: string): KycReviewItem | null {
+    const item = this.kyc.get(id);
+    if (!item) return null;
+    item.status = "approved";
+    item.rejectionReason = null;
+    item.reviewedBy = reviewerId;
+    item.reviewedAt = nowIso();
+    return item;
+  }
+
+  reject(id: string, reason: string, reviewerId: string): KycReviewItem | null {
+    const item = this.kyc.get(id);
+    if (!item) return null;
+    item.status = "rejected";
+    item.rejectionReason = reason;
+    item.reviewedBy = reviewerId;
+    item.reviewedAt = nowIso();
+    return item;
+  }
+
+  reset(): void {}
+}
+
+/**
+ * Memory role-application adapter. Approval also grants the platform role
+ * on the shared users map (mirrors the old inline handler).
+ */
+export class MemoryRoleApplicationsAdminQueue implements RoleApplicationsAdminQueueLike {
+  constructor(
+    readonly apps: Map<string, ApplicationItem>,
+    readonly users: Map<string, AdminManagedUser>,
+    readonly grantedRole: string,
+  ) {}
+
+  list(): ApplicationItem[] {
+    return [...this.apps.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  approve(id: string, reviewerId: string): ApplicationItem | null {
+    const app = this.apps.get(id);
+    if (!app) return null;
+    app.status = "approved";
+    app.reviewedBy = reviewerId;
+    app.reviewedAt = nowIso();
+    const user = this.users.get(app.userId);
+    if (user && !user.roles.includes(this.grantedRole)) user.roles.push(this.grantedRole);
+    return app;
+  }
+
+  decline(id: string, reason: string, reviewerId: string): ApplicationItem | null {
+    const app = this.apps.get(id);
+    if (!app) return null;
+    app.status = "declined";
+    app.declinedReason = reason;
+    app.reviewedBy = reviewerId;
+    app.reviewedAt = nowIso();
+    return app;
+  }
+
+  reset(): void {}
+}
+
+export class MemoryUsersAdminQueue implements UsersAdminQueueLike {
+  constructor(readonly users: Map<string, AdminManagedUser>) {}
+
+  list(role?: string, search?: string): AdminManagedUser[] {
+    const needle = search?.toLowerCase();
+    return [...this.users.values()]
+      .filter((user) => !role || user.roles.includes(role))
+      .filter(
+        (user) =>
+          !needle ||
+          user.name.toLowerCase().includes(needle) ||
+          (user.email ?? "").toLowerCase().includes(needle),
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  get(id: string): AdminManagedUser | undefined {
+    return this.users.get(id);
+  }
+
+  suspend(id: string, reason: string): AdminManagedUser | null {
+    const user = this.users.get(id);
+    if (!user) return null;
+    user.isSuspended = true;
+    user.suspensionReason = reason;
+    return user;
+  }
+
+  unsuspend(id: string): AdminManagedUser | null {
+    const user = this.users.get(id);
+    if (!user) return null;
+    user.isSuspended = false;
+    user.suspensionReason = null;
+    return user;
+  }
+
+  grantRole(id: string, role: string): AdminManagedUser | null {
+    const user = this.users.get(id);
+    if (!user) return null;
+    if (!user.roles.includes(role)) user.roles.push(role);
+    return user;
+  }
+
+  revokeRole(id: string, role: string): AdminManagedUser | null {
+    const user = this.users.get(id);
+    if (!user) return null;
+    user.roles = user.roles.filter((r) => r !== role);
+    return user;
+  }
+
+  reset(): void {}
+}
+
 // ── Serializers (snake_case, mirroring the Laravel API) ─────────────────────
 
 function serializeUser(user: AdminManagedUser): Record<string, unknown> {
@@ -650,6 +822,14 @@ export interface AdminPluginOptions {
   ticketsQueue?: TicketsAdminQueueLike;
   /** Broadcast queue (memory AdminStore array by default; `notification_broadcasts` in production). */
   broadcastsQueue?: BroadcastsAdminQueueLike;
+  /** KYC review queue (memory AdminStore map by default; `kyc_profiles` in production). */
+  kycQueue?: KycAdminQueueLike;
+  /** Seller-application review queue (memory map by default; `seller_applications` in production). */
+  sellersQueue?: RoleApplicationsAdminQueueLike;
+  /** Provider-application review queue (memory map by default; `provider_applications` in production). */
+  providersQueue?: RoleApplicationsAdminQueueLike;
+  /** Managed-users queue (memory AdminStore map by default; `users` in production). */
+  usersQueue?: UsersAdminQueueLike;
 }
 
 const STAFF = "admin|verifier";
@@ -666,6 +846,20 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
     options.ticketsQueue ?? (db ? createDbTicketsAdminQueue() : new MemoryTicketsAdminQueue(store.tickets));
   const broadcastsQueue =
     options.broadcastsQueue ?? (db ? createDbBroadcastsAdminQueue() : new MemoryBroadcastsAdminQueue(store));
+  const kycQueue =
+    options.kycQueue ?? (db ? createDbKycAdminQueue() : new MemoryKycAdminQueue(store.kyc));
+  const sellersQueue =
+    options.sellersQueue ??
+    (db
+      ? createDbSellerApplicationsAdminQueue()
+      : new MemoryRoleApplicationsAdminQueue(store.sellerApps, store.users, "seller"));
+  const providersQueue =
+    options.providersQueue ??
+    (db
+      ? createDbProviderApplicationsAdminQueue()
+      : new MemoryRoleApplicationsAdminQueue(store.providerApps, store.users, "provider"));
+  const usersQueue =
+    options.usersQueue ?? (db ? createDbUsersAdminQueue() : new MemoryUsersAdminQueue(store.users));
   const logs = options.logs ?? (db ? db.adminLogs : adminLogStore);
 
   return (
@@ -686,25 +880,18 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       })
 
       // ── KYC review ─────────────────────────────────────────────────
-      .get("/kyc", ({ staff, headers, status, query }) => {
+      .get("/kyc", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.kyc.values()]
-          .filter((item) => !query.status || item.status === query.status)
-          .filter((item) => !query.tier || item.tier === query.tier)
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const items = await kycQueue.list(query.status, query.tier);
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("KYC submissions retrieved.", data, meta);
       }, { query: KycQuery })
       .post("/kyc/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const item = store.kyc.get(params.id);
+        const item = await kycQueue.approve(params.id, (staff as StaffUser).id);
         if (!item) return status(404, fail("KYC submission not found."));
-        item.status = "approved";
-        item.rejectionReason = null;
-        item.reviewedBy = (staff as StaffUser).id;
-        item.reviewedAt = nowIso();
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "kyc.approved",
@@ -722,12 +909,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       .post("/kyc/:id/reject", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const item = store.kyc.get(params.id);
+        const item = await kycQueue.reject(params.id, body.reason, (staff as StaffUser).id);
         if (!item) return status(404, fail("KYC submission not found."));
-        item.status = "rejected";
-        item.rejectionReason = body.reason;
-        item.reviewedBy = (staff as StaffUser).id;
-        item.reviewedAt = nowIso();
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "kyc.rejected",
@@ -739,25 +922,18 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: ReasonBody })
 
       // ── Role applications ──────────────────────────────────────────
-      .get("/applications/sellers", ({ staff, headers, status, query }) => {
+      .get("/applications/sellers", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.sellerApps.values()].sort((a, b) =>
-          b.createdAt.localeCompare(a.createdAt),
-        );
+        const items = await sellersQueue.list();
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Seller applications retrieved.", data, meta);
       }, { query: PaginationQuery })
       .post("/applications/sellers/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const app = store.sellerApps.get(params.id);
+        const app = await sellersQueue.approve(params.id, (staff as StaffUser).id);
         if (!app) return status(404, fail("Seller application not found."));
-        app.status = "approved";
-        app.reviewedBy = (staff as StaffUser).id;
-        app.reviewedAt = nowIso();
-        const user = store.users.get(app.userId);
-        if (user && !user.roles.includes("seller")) user.roles.push("seller");
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "seller_application.approved",
@@ -770,12 +946,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       .post("/applications/sellers/:id/decline", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const app = store.sellerApps.get(params.id);
+        const app = await sellersQueue.decline(params.id, body.reason, (staff as StaffUser).id);
         if (!app) return status(404, fail("Seller application not found."));
-        app.status = "declined";
-        app.declinedReason = body.reason;
-        app.reviewedBy = (staff as StaffUser).id;
-        app.reviewedAt = nowIso();
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "seller_application.declined",
@@ -785,25 +957,18 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         });
         return ok("Seller application declined.", { id: app.id });
       }, { body: ReasonBody })
-      .get("/applications/providers", ({ staff, headers, status, query }) => {
+      .get("/applications/providers", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.providerApps.values()].sort((a, b) =>
-          b.createdAt.localeCompare(a.createdAt),
-        );
+        const items = await providersQueue.list();
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Provider applications retrieved.", data, meta);
       }, { query: PaginationQuery })
       .post("/applications/providers/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const app = store.providerApps.get(params.id);
+        const app = await providersQueue.approve(params.id, (staff as StaffUser).id);
         if (!app) return status(404, fail("Provider application not found."));
-        app.status = "approved";
-        app.reviewedBy = (staff as StaffUser).id;
-        app.reviewedAt = nowIso();
-        const user = store.users.get(app.userId);
-        if (user && !user.roles.includes("provider")) user.roles.push("provider");
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "provider_application.approved",
@@ -816,12 +981,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       .post("/applications/providers/:id/decline", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const app = store.providerApps.get(params.id);
+        const app = await providersQueue.decline(params.id, body.reason, (staff as StaffUser).id);
         if (!app) return status(404, fail("Provider application not found."));
-        app.status = "declined";
-        app.declinedReason = body.reason;
-        app.reviewedBy = (staff as StaffUser).id;
-        app.reviewedAt = nowIso();
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "provider_application.declined",
@@ -833,30 +994,18 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: ReasonBody })
 
       // ── User management ────────────────────────────────────────────
-      .get("/users", ({ staff, headers, status, query }) => {
+      .get("/users", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const search = query.search?.toLowerCase();
-        const items = [...store.users.values()]
-          .filter((user) => !query.role || user.roles.includes(query.role))
-          .filter(
-            (user) =>
-              !search ||
-              user.name.toLowerCase().includes(search) ||
-              (user.email ?? "").toLowerCase().includes(search),
-          )
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-          .map(serializeUser);
+        const items = (await usersQueue.list(query.role, query.search)).map(serializeUser);
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 25);
         return ok("Users retrieved.", data, meta);
       }, { query: UsersQuery })
       .post("/users/:id/suspend", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
-        const user = store.users.get(params.id);
+        const user = await usersQueue.suspend(params.id, body.reason);
         if (!user) return status(404, fail("User not found."));
-        user.isSuspended = true;
-        user.suspensionReason = body.reason;
         // TODO(db): revoke the user's API tokens so suspension logs them out.
         await logs.log({
           adminId: (staff as StaffUser).id,
@@ -870,10 +1019,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       .post("/users/:id/unsuspend", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
-        const user = store.users.get(params.id);
+        const user = await usersQueue.unsuspend(params.id);
         if (!user) return status(404, fail("User not found."));
-        user.isSuspended = false;
-        user.suspensionReason = null;
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "user.unsuspended",
@@ -886,10 +1033,9 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       .post("/users/:id/assign-role", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
-        const user = store.users.get(params.id);
-        if (!user) return status(404, fail("User not found."));
         if (body.action === "grant") {
-          if (!user.roles.includes(body.role)) user.roles.push(body.role);
+          const user = await usersQueue.grantRole(params.id, body.role);
+          if (!user) return status(404, fail("User not found."));
           await logs.log({
             adminId: (staff as StaffUser).id,
             action: "user.role_granted",
@@ -899,7 +1045,8 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           });
           return ok(`Role '${body.role}' granted to [${user.name}].`, serializeUser(user));
         }
-        user.roles = user.roles.filter((role) => role !== body.role);
+        const user = await usersQueue.revokeRole(params.id, body.role);
+        if (!user) return status(404, fail("User not found."));
         await logs.log({
           adminId: (staff as StaffUser).id,
           action: "user.role_revoked",

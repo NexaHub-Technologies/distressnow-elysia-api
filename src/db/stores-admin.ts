@@ -15,14 +15,18 @@
  * path regardless of DATABASE_URL.
  */
 
-import { and, desc, eq, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, ilike, inArray, or, sql, type SQL } from "drizzle-orm";
 import { db } from "./client";
 import {
   adverts,
   adminLogs,
+  kycProfiles,
+  kycStatusEnum,
   modelHasRoles,
   notificationBroadcasts,
+  providerApplications,
   roles,
+  sellerApplications,
   supportTickets,
   ticketPriorityEnum,
   ticketStatusEnum,
@@ -36,16 +40,70 @@ import { nowIso } from "../utils/phone";
 import type {
   AdminLogRow,
   AdminLogStoreLike,
+  AdminManagedUser,
   AdvertItem,
   AdvertsAdminQueueLike,
+  ApplicationItem,
   BroadcastItem,
   BroadcastsAdminQueueLike,
+  KycAdminQueueLike,
+  KycReviewItem,
+  RoleApplicationsAdminQueueLike,
   SupportTicketItem,
   TicketsAdminQueueLike,
+  UsersAdminQueueLike,
 } from "../modules/admin/index";
 
 /** spatie/laravel-permission model_type (matches seed data + auth UserStore). */
 const MODEL_TYPE = "App\\Models\\User";
+
+/** Guard enum columns so a bogus filter can't 500 on a Postgres enum. */
+function validEnum(values: readonly string[], value: string | undefined): value is string {
+  return value !== undefined && values.includes(value);
+}
+
+/** Role names for one user (spatie shape, same MODEL_TYPE as the auth UserStore). */
+async function loadRoleNames(userId: number): Promise<string[]> {
+  const rows = await db
+    .select({ name: roles.name })
+    .from(modelHasRoles)
+    .innerJoin(roles, eq(modelHasRoles.roleId, roles.id))
+    .where(and(eq(modelHasRoles.modelId, userId), eq(modelHasRoles.modelType, MODEL_TYPE)));
+  return rows.map((r) => r.name);
+}
+
+/** Best-effort role grant (missing seed role, or any DB error, never throws). */
+async function grantRoleName(userId: number, roleName: string): Promise<void> {
+  try {
+    const [role] = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, roleName)).limit(1);
+    if (!role) return;
+    await db
+      .insert(modelHasRoles)
+      .values({ roleId: role.id, modelType: MODEL_TYPE, modelId: userId })
+      .onConflictDoNothing();
+  } catch (err) {
+    console.warn("[admin:roles] grant failed", { userId, roleName, error: (err as Error).message });
+  }
+}
+
+/** Best-effort role revoke (never throws). */
+async function revokeRoleName(userId: number, roleName: string): Promise<void> {
+  try {
+    const [role] = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, roleName)).limit(1);
+    if (!role) return;
+    await db
+      .delete(modelHasRoles)
+      .where(
+        and(
+          eq(modelHasRoles.modelId, userId),
+          eq(modelHasRoles.modelType, MODEL_TYPE),
+          eq(modelHasRoles.roleId, role.id),
+        ),
+      );
+  } catch (err) {
+    console.warn("[admin:roles] revoke failed", { userId, roleName, error: (err as Error).message });
+  }
+}
 
 // ── admin_logs ────────────────────────────────────────────────────────────
 
@@ -227,11 +285,6 @@ export function createDbTicketsAdminQueue(): TicketsAdminQueueLike {
     };
   }
 
-  /** Guard enum columns so a bogus filter can't 500 on a Postgres enum. */
-  function validEnum(values: readonly string[], value: string | undefined): value is string {
-    return value !== undefined && values.includes(value);
-  }
-
   return {
     async list(status, priority) {
       const filters: SQL[] = [];
@@ -362,6 +415,304 @@ export function createDbBroadcastsAdminQueue(): BroadcastsAdminQueueLike {
         })
         .returning();
       return row ? rowToItem(row) : item;
+    },
+
+    /** No-op for parity: DB rows persist across requests (tests use memory). */
+    reset(): void {},
+  };
+}
+// ── KYC review queue ──────────────────────────────────────────────────────
+
+/**
+ * KYC review overlay over `kyc_profiles`. Mirrors the memory adapter:
+ * list (newest first, optional status/tier filters), approve (status +
+ * reviewer), reject (status + reason + reviewer).
+ */
+export function createDbKycAdminQueue(): KycAdminQueueLike {
+  type Row = typeof kycProfiles.$inferSelect;
+
+  function rowToItem(row: Row): KycReviewItem {
+    return {
+      id: String(row.id),
+      userId: String(row.userId),
+      tier: row.tier === 2 ? 2 : 1,
+      status: (row.status ?? "pending") as KycReviewItem["status"],
+      rejectionReason: row.rejectionReason,
+      reviewedBy: row.reviewedBy != null ? String(row.reviewedBy) : null,
+      reviewedAt: toIso(row.reviewedAt),
+      createdAt: toIso(row.createdAt) ?? nowIso(),
+    };
+  }
+
+  return {
+    async list(status, tier) {
+      const filters: SQL[] = [];
+      if (validEnum(kycStatusEnum.enumValues as readonly string[], status)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        filters.push(eq(kycProfiles.status, status as any));
+      }
+      if (tier === 1 || tier === 2) {
+        filters.push(eq(kycProfiles.tier, tier));
+      }
+      const base =
+        filters.length > 0
+          ? db.select().from(kycProfiles).where(and(...filters))
+          : db.select().from(kycProfiles);
+      const rows = await base.orderBy(desc(kycProfiles.createdAt));
+      return rows.map(rowToItem);
+    },
+
+    async approve(id, reviewerId) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(kycProfiles)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          status: "approved" as any,
+          rejectionReason: null,
+          reviewedBy: numericUserId(reviewerId),
+          reviewedAt: new Date(),
+        })
+        .where(eq(kycProfiles.id, numeric))
+        .returning();
+      return row ? rowToItem(row) : null;
+    },
+
+    async reject(id, reason, reviewerId) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(kycProfiles)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          status: "rejected" as any,
+          rejectionReason: reason,
+          reviewedBy: numericUserId(reviewerId),
+          reviewedAt: new Date(),
+        })
+        .where(eq(kycProfiles.id, numeric))
+        .returning();
+      return row ? rowToItem(row) : null;
+    },
+
+    /** No-op for parity: DB rows persist across requests (tests use memory). */
+    reset(): void {},
+  };
+}
+
+// ── Seller / provider application review queues ───────────────────────────
+
+/**
+ * Role-application review overlay shared by `seller_applications` and
+ * `provider_applications` (identical review columns). Approval also grants
+ * the platform role via model_has_roles (best-effort); decline records the
+ * reason. Mirrors the memory adapter including the role side effect.
+ */
+function createDbApplicationReviewQueue(
+  table: typeof sellerApplications | typeof providerApplications,
+  grantedRole: string,
+): RoleApplicationsAdminQueueLike {
+  type Row = {
+    id: number;
+    userId: number;
+    status: string | null;
+    declinedReason: string | null;
+    reviewedBy: number | null;
+    reviewedAt: Date | null;
+    createdAt: Date | null;
+  };
+
+  function rowToItem(row: Row): ApplicationItem {
+    return {
+      id: String(row.id),
+      userId: String(row.userId),
+      status: (row.status ?? "pending") as ApplicationItem["status"],
+      declinedReason: row.declinedReason,
+      reviewedBy: row.reviewedBy != null ? String(row.reviewedBy) : null,
+      reviewedAt: toIso(row.reviewedAt),
+      createdAt: toIso(row.createdAt) ?? nowIso(),
+    };
+  }
+
+  return {
+    async list() {
+      const rows = await db.select().from(table).orderBy(desc(table.createdAt));
+      return rows.map(rowToItem);
+    },
+
+    async approve(id, reviewerId) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(table)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          status: "approved" as any,
+          declinedReason: null,
+          reviewedBy: numericUserId(reviewerId),
+          reviewedAt: new Date(),
+        })
+        .where(eq(table.id, numeric))
+        .returning();
+      if (!row) return null;
+      await grantRoleName(row.userId, grantedRole);
+      return rowToItem(row);
+    },
+
+    async decline(id, reason, reviewerId) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(table)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          status: "declined" as any,
+          declinedReason: reason,
+          reviewedBy: numericUserId(reviewerId),
+          reviewedAt: new Date(),
+        })
+        .where(eq(table.id, numeric))
+        .returning();
+      return row ? rowToItem(row) : null;
+    },
+
+    /** No-op for parity: DB rows persist across requests (tests use memory). */
+    reset(): void {},
+  };
+}
+
+/** Seller-application review queue (`seller_applications`, grants `seller`). */
+export function createDbSellerApplicationsAdminQueue(): RoleApplicationsAdminQueueLike {
+  return createDbApplicationReviewQueue(sellerApplications, "seller");
+}
+
+/** Provider-application review queue (`provider_applications`, grants `provider`). */
+export function createDbProviderApplicationsAdminQueue(): RoleApplicationsAdminQueueLike {
+  return createDbApplicationReviewQueue(providerApplications, "provider");
+}
+
+// ── Managed-users queue ───────────────────────────────────────────────────
+
+/**
+ * Managed-users overlay over `users` + `model_has_roles`. List supports the
+ * same role/search filters as the memory adapter (roles resolved per user);
+ * suspend/unsuspend and grant/revoke persist to the user row / role pivot.
+ */
+export function createDbUsersAdminQueue(): UsersAdminQueueLike {
+  async function rowToUser(
+    row: typeof users.$inferSelect,
+    rolesByUser?: Map<number, string[]>,
+  ): Promise<AdminManagedUser> {
+    return {
+      id: String(row.id),
+      name: row.name,
+      email: row.email,
+      roles: rolesByUser?.get(row.id) ?? (await loadRoleNames(row.id)),
+      state: row.locationState,
+      isSuspended: row.isSuspended,
+      suspensionReason: row.suspensionReason,
+      createdAt: toIso(row.createdAt) ?? nowIso(),
+    };
+  }
+
+  return {
+    async list(role, search) {
+      const needle = search?.trim();
+      const filters: SQL[] = [];
+      if (needle) {
+        const pattern = `%${needle}%`;
+        const emailMatch = ilike(users.email, pattern);
+        const either = emailMatch
+          ? or(ilike(users.name, pattern), emailMatch)
+          : ilike(users.name, pattern);
+        if (either) filters.push(either);
+      }
+      if (role) {
+        const withRole = await db
+          .select({ userId: modelHasRoles.modelId })
+          .from(modelHasRoles)
+          .innerJoin(roles, eq(modelHasRoles.roleId, roles.id))
+          .where(and(eq(roles.name, role), eq(modelHasRoles.modelType, MODEL_TYPE)));
+        const ids = withRole.map((r) => r.userId);
+        if (ids.length === 0) return [];
+        filters.push(inArray(users.id, ids));
+      }
+      const base =
+        filters.length > 0
+          ? db.select().from(users).where(and(...filters))
+          : db.select().from(users);
+      const rows = await base.orderBy(desc(users.createdAt));
+      // One query for every listed user's roles (page-sized, not N+1).
+      const rolesByUser = new Map<number, string[]>();
+      if (rows.length > 0) {
+        const roleRows = await db
+          .select({ userId: modelHasRoles.modelId, name: roles.name })
+          .from(modelHasRoles)
+          .innerJoin(roles, eq(modelHasRoles.roleId, roles.id))
+          .where(
+            and(
+              inArray(
+                modelHasRoles.modelId,
+                rows.map((r) => r.id),
+              ),
+              eq(modelHasRoles.modelType, MODEL_TYPE),
+            ),
+          );
+        for (const r of roleRows) {
+          const list = rolesByUser.get(r.userId) ?? [];
+          list.push(r.name);
+          rolesByUser.set(r.userId, list);
+        }
+      }
+      return Promise.all(rows.map((row) => rowToUser(row, rolesByUser)));
+    },
+
+    async get(id) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return undefined;
+      const [row] = await db.select().from(users).where(eq(users.id, numeric)).limit(1);
+      return row ? rowToUser(row) : undefined;
+    },
+
+    async suspend(id, reason) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(users)
+        .set({ isSuspended: true, suspensionReason: reason, suspendedAt: new Date() })
+        .where(eq(users.id, numeric))
+        .returning();
+      return row ? rowToUser(row) : null;
+    },
+
+    async unsuspend(id) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db
+        .update(users)
+        .set({ isSuspended: false, suspensionReason: null })
+        .where(eq(users.id, numeric))
+        .returning();
+      return row ? rowToUser(row) : null;
+    },
+
+    async grantRole(id, roleName) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db.select().from(users).where(eq(users.id, numeric)).limit(1);
+      if (!row) return null;
+      await grantRoleName(numeric, roleName);
+      return rowToUser(row);
+    },
+
+    async revokeRole(id, roleName) {
+      const numeric = numericUserId(id);
+      if (numeric == null) return null;
+      const [row] = await db.select().from(users).where(eq(users.id, numeric)).limit(1);
+      if (!row) return null;
+      await revokeRoleName(numeric, roleName);
+      return rowToUser(row);
     },
 
     /** No-op for parity: DB rows persist across requests (tests use memory). */
