@@ -27,7 +27,12 @@
  */
 import { Elysia, t } from "elysia";
 import { applyAuthGuard, type UserStore } from "../auth/index";
-import { getDbStores } from "../../db/stores";
+import { dbModeActive, getDbStores } from "../../db/stores";
+import {
+  createDbAdvertsAdminQueue,
+  createDbBroadcastsAdminQueue,
+  createDbTicketsAdminQueue,
+} from "../../db/stores-admin";
 import { newId, nowIso } from "../../utils/phone";
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
@@ -317,6 +322,191 @@ export class AdminStore {
 /** Default singleton (override via plugin options in tests). */
 export const adminStore = new AdminStore();
 
+// ── Admin audit log ─────────────────────────────────────────────────────────
+
+export interface AdminLogRow {
+  id: number;
+  adminId: string;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  details: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface AdminLogInput {
+  adminId: string;
+  action: string;
+  targetType?: string | null;
+  targetId?: string | number | null;
+  details?: Record<string, unknown> | null;
+}
+
+export class MemoryAdminLogStore {
+  rows: AdminLogRow[] = [];
+  private seq = 1;
+
+  reset(): void {
+    this.rows = [];
+    this.seq = 1;
+  }
+
+  log(entry: AdminLogInput): AdminLogRow {
+    const row: AdminLogRow = {
+      id: this.seq++,
+      adminId: entry.adminId,
+      action: entry.action,
+      targetType: entry.targetType ?? null,
+      targetId: entry.targetId != null ? String(entry.targetId) : null,
+      details: entry.details ?? null,
+      createdAt: nowIso(),
+    };
+    this.rows.push(row);
+    return row;
+  }
+}
+
+/** The in-memory sync log store (tests stay on it regardless of DATABASE_URL). */
+export const adminLogStore = new MemoryAdminLogStore();
+
+/**
+ * Store surface consumed by the admin handlers. Widened to `T | Promise<T>`
+ * so the DB-backed overlay (createDbAdminLogStore) implements the same shape;
+ * handlers uniformly `await`.
+ */
+export interface AdminLogStoreLike {
+  log(entry: AdminLogInput): AdminLogRow | Promise<AdminLogRow>;
+  reset(): void | Promise<void>;
+}
+
+// ── Admin review queue seams ────────────────────────────────────────────────
+
+export interface AdvertsAdminQueueStats {
+  total: number;
+  active: number;
+  pending: number;
+  expired: number;
+  revenue: number;
+}
+
+export interface AdvertsAdminQueueLike {
+  list(status?: string): AdvertItem[] | Promise<AdvertItem[]>;
+  stats(): AdvertsAdminQueueStats | Promise<AdvertsAdminQueueStats>;
+  publish(id: string): AdvertItem | null | Promise<AdvertItem | null>;
+  unpublish(id: string): AdvertItem | null | Promise<AdvertItem | null>;
+  reset(): void | Promise<void>;
+}
+
+export interface TicketsAdminQueueLike {
+  list(status?: string, priority?: string): SupportTicketItem[] | Promise<SupportTicketItem[]>;
+  get(id: string): SupportTicketItem | undefined | Promise<SupportTicketItem | undefined>;
+  assign(ticket: SupportTicketItem, agentId: string): SupportTicketItem | Promise<SupportTicketItem>;
+  reset(): void | Promise<void>;
+}
+
+export interface BroadcastsAdminQueueLike {
+  list(): BroadcastItem[] | Promise<BroadcastItem[]>;
+  recipientCount(
+    audience: string,
+    role?: string,
+    state?: string,
+    userIds?: string[],
+  ): number | Promise<number>;
+  create(item: BroadcastItem): BroadcastItem | Promise<BroadcastItem>;
+  reset(): void | Promise<void>;
+}
+
+/**
+ * Memory queue adapters over an AdminStore's collections. The admin tests
+ * assert on the shared maps/arrays after mutations (`store.adverts.get(...)`,
+ * `store.tickets.get(...)`, `store.broadcasts.length`), so these mutate in
+ * place exactly like the old inline handlers.
+ */
+export class MemoryAdvertsAdminQueue implements AdvertsAdminQueueLike {
+  constructor(readonly adverts: Map<string, AdvertItem>) {}
+
+  list(status?: string): AdvertItem[] {
+    return [...this.adverts.values()]
+      .filter((advert) => !status || advert.status === status)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  stats(): AdvertsAdminQueueStats {
+    const adverts = [...this.adverts.values()];
+    return {
+      total: adverts.length,
+      active: adverts.filter((advert) => advert.status === "active").length,
+      pending: adverts.filter((advert) => advert.status === "pending").length,
+      expired: adverts.filter((advert) => advert.status === "expired").length,
+      revenue: adverts.reduce((sum, advert) => sum + advert.amountPaid, 0),
+    };
+  }
+
+  publish(id: string): AdvertItem | null {
+    const advert = this.adverts.get(id);
+    if (!advert) return null;
+    const now = new Date();
+    advert.status = "active";
+    advert.publishedAt = now.toISOString();
+    advert.expiresAt = new Date(
+      now.getTime() + advert.durationDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    return advert;
+  }
+
+  unpublish(id: string): AdvertItem | null {
+    const advert = this.adverts.get(id);
+    if (!advert) return null;
+    advert.status = "unpublished";
+    return advert;
+  }
+
+  reset(): void {}
+}
+
+export class MemoryTicketsAdminQueue implements TicketsAdminQueueLike {
+  constructor(readonly tickets: Map<string, SupportTicketItem>) {}
+
+  list(status?: string, priority?: string): SupportTicketItem[] {
+    return [...this.tickets.values()]
+      .filter((ticket) => !status || ticket.status === status)
+      .filter((ticket) => !priority || ticket.priority === priority)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  get(id: string): SupportTicketItem | undefined {
+    return this.tickets.get(id);
+  }
+
+  assign(ticket: SupportTicketItem, agentId: string): SupportTicketItem {
+    // In-place mutation: the caller holds the shared map entry, so
+    // `store.tickets.get(id)?.assignedTo` reflects the assignment.
+    ticket.assignedTo = agentId;
+    return ticket;
+  }
+
+  reset(): void {}
+}
+
+export class MemoryBroadcastsAdminQueue implements BroadcastsAdminQueueLike {
+  constructor(readonly store: AdminStore) {}
+
+  list(): BroadcastItem[] {
+    return [...this.store.broadcasts].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  recipientCount(audience: string, role?: string, state?: string, userIds?: string[]): number {
+    return this.store.recipientCount(audience, role, state, userIds);
+  }
+
+  create(item: BroadcastItem): BroadcastItem {
+    this.store.broadcasts.push(item);
+    return item;
+  }
+
+  reset(): void {}
+}
+
 // ── Serializers (snake_case, mirroring the Laravel API) ─────────────────────
 
 function serializeUser(user: AdminManagedUser): Record<string, unknown> {
@@ -452,12 +642,31 @@ export interface AdminPluginOptions {
   store?: AdminStore;
   users?: UserStore;
   secret?: string;
+  /** Audit-trail store (memory default; DB-backed `admin_logs` in production). */
+  logs?: AdminLogStoreLike;
+  /** Adverts review queue (memory AdminStore map by default; `adverts` table in production). */
+  advertsQueue?: AdvertsAdminQueueLike;
+  /** Support ticket review queue (memory AdminStore map by default; `support_tickets` in production). */
+  ticketsQueue?: TicketsAdminQueueLike;
+  /** Broadcast queue (memory AdminStore array by default; `notification_broadcasts` in production). */
+  broadcastsQueue?: BroadcastsAdminQueueLike;
 }
 
 const STAFF = "admin|verifier";
 
 export function createAdminPlugin(options: AdminPluginOptions = {}) {
   const store = options.store ?? adminStore;
+  // DB-backed queues/log only when no explicit in-memory AdminStore was
+  // injected (tests always pass one, so they stay on the memory path).
+  const db = dbModeActive() && options.store === undefined ? getDbStores() : null;
+
+  const advertsQueue =
+    options.advertsQueue ?? (db ? createDbAdvertsAdminQueue() : new MemoryAdvertsAdminQueue(store.adverts));
+  const ticketsQueue =
+    options.ticketsQueue ?? (db ? createDbTicketsAdminQueue() : new MemoryTicketsAdminQueue(store.tickets));
+  const broadcastsQueue =
+    options.broadcastsQueue ?? (db ? createDbBroadcastsAdminQueue() : new MemoryBroadcastsAdminQueue(store));
+  const logs = options.logs ?? (db ? db.adminLogs : adminLogStore);
 
   return (
     applyAuthGuard(new Elysia({ prefix: "/api/v1/admin" }), {
@@ -487,7 +696,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("KYC submissions retrieved.", data, meta);
       }, { query: KycQuery })
-      .post("/kyc/:id/approve", ({ staff, headers, status, params }) => {
+      .post("/kyc/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.kyc.get(params.id);
@@ -496,6 +705,13 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         item.rejectionReason = null;
         item.reviewedBy = (staff as StaffUser).id;
         item.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "kyc.approved",
+          targetType: "kyc_submission",
+          targetId: item.id,
+          details: { tier: item.tier, userId: item.userId },
+        });
         // TODO(db): notify the user (kyc_approval) via NotificationService port.
         return ok(`KYC #${item.id} approved. User can now apply for roles.`, {
           id: item.id,
@@ -503,7 +719,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           status: item.status,
         });
       })
-      .post("/kyc/:id/reject", ({ staff, headers, status, params, body }) => {
+      .post("/kyc/:id/reject", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.kyc.get(params.id);
@@ -512,6 +728,13 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         item.rejectionReason = body.reason;
         item.reviewedBy = (staff as StaffUser).id;
         item.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "kyc.rejected",
+          targetType: "kyc_submission",
+          targetId: item.id,
+          details: { tier: item.tier, userId: item.userId, reason: body.reason },
+        });
         return ok(`KYC #${item.id} rejected.`, { id: item.id, reason: body.reason });
       }, { body: ReasonBody })
 
@@ -525,7 +748,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Seller applications retrieved.", data, meta);
       }, { query: PaginationQuery })
-      .post("/applications/sellers/:id/approve", ({ staff, headers, status, params }) => {
+      .post("/applications/sellers/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.sellerApps.get(params.id);
@@ -535,9 +758,16 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         app.reviewedAt = nowIso();
         const user = store.users.get(app.userId);
         if (user && !user.roles.includes("seller")) user.roles.push("seller");
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "seller_application.approved",
+          targetType: "seller_application",
+          targetId: app.id,
+          details: { userId: app.userId },
+        });
         return ok("Seller application approved.", { id: app.id, status: app.status });
       })
-      .post("/applications/sellers/:id/decline", ({ staff, headers, status, params, body }) => {
+      .post("/applications/sellers/:id/decline", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.sellerApps.get(params.id);
@@ -546,6 +776,13 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         app.declinedReason = body.reason;
         app.reviewedBy = (staff as StaffUser).id;
         app.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "seller_application.declined",
+          targetType: "seller_application",
+          targetId: app.id,
+          details: { userId: app.userId, reason: body.reason },
+        });
         return ok("Seller application declined.", { id: app.id });
       }, { body: ReasonBody })
       .get("/applications/providers", ({ staff, headers, status, query }) => {
@@ -557,7 +794,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Provider applications retrieved.", data, meta);
       }, { query: PaginationQuery })
-      .post("/applications/providers/:id/approve", ({ staff, headers, status, params }) => {
+      .post("/applications/providers/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.providerApps.get(params.id);
@@ -567,9 +804,16 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         app.reviewedAt = nowIso();
         const user = store.users.get(app.userId);
         if (user && !user.roles.includes("provider")) user.roles.push("provider");
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "provider_application.approved",
+          targetType: "provider_application",
+          targetId: app.id,
+          details: { userId: app.userId },
+        });
         return ok("Provider application approved.", { id: app.id, status: app.status });
       })
-      .post("/applications/providers/:id/decline", ({ staff, headers, status, params, body }) => {
+      .post("/applications/providers/:id/decline", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const app = store.providerApps.get(params.id);
@@ -578,6 +822,13 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         app.declinedReason = body.reason;
         app.reviewedBy = (staff as StaffUser).id;
         app.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "provider_application.declined",
+          targetType: "provider_application",
+          targetId: app.id,
+          details: { userId: app.userId, reason: body.reason },
+        });
         return ok("Provider application declined.", { id: app.id });
       }, { body: ReasonBody })
 
@@ -599,7 +850,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 25);
         return ok("Users retrieved.", data, meta);
       }, { query: UsersQuery })
-      .post("/users/:id/suspend", ({ staff, headers, status, params, body }) => {
+      .post("/users/:id/suspend", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
@@ -607,27 +858,55 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         user.isSuspended = true;
         user.suspensionReason = body.reason;
         // TODO(db): revoke the user's API tokens so suspension logs them out.
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "user.suspended",
+          targetType: "user",
+          targetId: user.id,
+          details: { name: user.name, reason: body.reason },
+        });
         return ok(`User [${user.name}] has been suspended.`, serializeUser(user));
       }, { body: ReasonBody })
-      .post("/users/:id/unsuspend", ({ staff, headers, status, params }) => {
+      .post("/users/:id/unsuspend", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
         if (!user) return status(404, fail("User not found."));
         user.isSuspended = false;
         user.suspensionReason = null;
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "user.unsuspended",
+          targetType: "user",
+          targetId: user.id,
+          details: { name: user.name },
+        });
         return ok(`User [${user.name}] has been unsuspended.`, serializeUser(user));
       })
-      .post("/users/:id/assign-role", ({ staff, headers, status, params, body }) => {
+      .post("/users/:id/assign-role", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const user = store.users.get(params.id);
         if (!user) return status(404, fail("User not found."));
         if (body.action === "grant") {
           if (!user.roles.includes(body.role)) user.roles.push(body.role);
+          await logs.log({
+            adminId: (staff as StaffUser).id,
+            action: "user.role_granted",
+            targetType: "user",
+            targetId: user.id,
+            details: { name: user.name, role: body.role },
+          });
           return ok(`Role '${body.role}' granted to [${user.name}].`, serializeUser(user));
         }
         user.roles = user.roles.filter((role) => role !== body.role);
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "user.role_revoked",
+          targetType: "user",
+          targetId: user.id,
+          details: { name: user.name, role: body.role },
+        });
         return ok(`Role '${body.role}' revoked from [${user.name}].`, serializeUser(user));
       }, { body: AssignRoleBody })
 
@@ -646,7 +925,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/markets", ({ staff, headers, body, status }) => {
+      .post("/markets", async ({ staff, headers, body, status }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const market: MarketItem = {
@@ -662,9 +941,16 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           createdAt: nowIso(),
         };
         store.markets.set(market.id, market);
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "market.created",
+          targetType: "market",
+          targetId: market.id,
+          details: { name: market.name, stateId: market.stateId },
+        });
         return status(201, ok("Market created successfully.", serializeMarket(market)));
       }, { body: MarketBody })
-      .put("/markets/:id", ({ staff, headers, status, params, body }) => {
+      .put("/markets/:id", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const market = store.markets.get(params.id);
@@ -677,23 +963,33 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         if (body.latitude !== undefined) market.latitude = body.latitude;
         if (body.longitude !== undefined) market.longitude = body.longitude;
         if (body.is_active !== undefined) market.isActive = body.is_active;
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "market.updated",
+          targetType: "market",
+          targetId: market.id,
+          details: { name: market.name },
+        });
         return ok("Market updated.", serializeMarket(market));
       }, { body: MarketUpdateBody })
-      .delete("/markets/:id", ({ staff, headers, status, params }) => {
+      .delete("/markets/:id", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         if (!store.markets.delete(params.id)) return status(404, fail("Market not found."));
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "market.deleted",
+          targetType: "market",
+          targetId: params.id,
+        });
         return ok("Market deleted successfully.", null);
       })
 
       // ── Support queue ──────────────────────────────────────────────
-      .get("/support/tickets", ({ staff, headers, status, query }) => {
+      .get("/support/tickets", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.tickets.values()]
-          .filter((ticket) => !query.status || ticket.status === query.status)
-          .filter((ticket) => !query.priority || ticket.priority === query.priority)
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const items = await ticketsQueue.list(query.status, query.priority);
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Support tickets retrieved.", data, meta);
       }, { query: t.Object({
@@ -702,18 +998,25 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/support/tickets/:id/assign", ({ staff, headers, status, params, body }) => {
+      .post("/support/tickets/:id/assign", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const ticket = store.tickets.get(params.id);
+        const ticket = await ticketsQueue.get(params.id);
         if (!ticket) return status(404, fail("Support ticket not found."));
         const agentId = body.agent_id ?? (staff as StaffUser).id;
         const agent = store.users.get(agentId);
         if (agent && !hasRequiredRole(agent.roles, STAFF)) {
           return status(422, fail("Tickets can only be assigned to an admin or verifier."));
         }
-        ticket.assignedTo = agentId;
-        return ok(`Ticket ${ticket.ticketNumber} assigned.`, ticket);
+        const assigned = await ticketsQueue.assign(ticket, agentId);
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "support_ticket.assigned",
+          targetType: "support_ticket",
+          targetId: ticket.id,
+          details: { ticketNumber: ticket.ticketNumber, agentId },
+        });
+        return ok(`Ticket ${assigned.ticketNumber} assigned.`, assigned);
       }, { body: AssignTicketBody })
 
       // ── Contact updates ────────────────────────────────────────────
@@ -732,7 +1035,7 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         page: t.Optional(t.Numeric({ minimum: 1 })),
         per_page: t.Optional(t.Numeric({ minimum: 1, maximum: 100 })),
       }) })
-      .post("/contact-updates/:id/approve", ({ staff, headers, status, params }) => {
+      .post("/contact-updates/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.contactUpdates.get(params.id);
@@ -743,9 +1046,16 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         item.status = "approved";
         item.reviewedBy = (staff as StaffUser).id;
         item.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "contact_update.approved",
+          targetType: "contact_update",
+          targetId: item.id,
+          details: { providerId: item.providerId },
+        });
         return ok("Contact update approved and applied.", item);
       })
-      .post("/contact-updates/:id/reject", ({ staff, headers, status, params }) => {
+      .post("/contact-updates/:id/reject", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const item = store.contactUpdates.get(params.id);
@@ -756,50 +1066,55 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         item.status = "rejected";
         item.reviewedBy = (staff as StaffUser).id;
         item.reviewedAt = nowIso();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "contact_update.rejected",
+          targetType: "contact_update",
+          targetId: item.id,
+          details: { providerId: item.providerId },
+        });
         return ok("Contact update rejected.", item);
       })
 
       // ── Adverts ────────────────────────────────────────────────────
-      .get("/adverts", ({ staff, headers, status, query }) => {
+      .get("/adverts", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.adverts.values()]
-          .filter((advert) => !query.status || advert.status === query.status)
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const items = await advertsQueue.list(query.status);
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Adverts retrieved.", data, meta);
       }, { query: AdvertsQuery })
-      .get("/adverts/stats", ({ staff, headers, status }) => {
+      .get("/adverts/stats", async ({ staff, headers, status }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const adverts = [...store.adverts.values()];
-        return ok("Advert stats retrieved.", {
-          total: adverts.length,
-          active: adverts.filter((advert) => advert.status === "active").length,
-          pending: adverts.filter((advert) => advert.status === "pending").length,
-          expired: adverts.filter((advert) => advert.status === "expired").length,
-          revenue: adverts.reduce((sum, advert) => sum + advert.amountPaid, 0),
-        });
+        return ok("Advert stats retrieved.", await advertsQueue.stats());
       })
-      .post("/adverts/:id/publish", ({ staff, headers, status, params }) => {
+      .post("/adverts/:id/publish", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const advert = store.adverts.get(params.id);
+        const advert = await advertsQueue.publish(params.id);
         if (!advert) return status(404, fail("Advert not found."));
-        const now = new Date();
-        advert.status = "active";
-        advert.publishedAt = now.toISOString();
-        advert.expiresAt = new Date(
-          now.getTime() + advert.durationDays * 24 * 60 * 60 * 1000,
-        ).toISOString();
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "advert.published",
+          targetType: "advert",
+          targetId: advert.id,
+          details: { title: advert.title, durationDays: advert.durationDays },
+        });
         return ok("Advert published.", advert);
       })
-      .post("/adverts/:id/unpublish", ({ staff, headers, status, params }) => {
+      .post("/adverts/:id/unpublish", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
-        const advert = store.adverts.get(params.id);
+        const advert = await advertsQueue.unpublish(params.id);
         if (!advert) return status(404, fail("Advert not found."));
-        advert.status = "unpublished";
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "advert.unpublished",
+          targetType: "advert",
+          targetId: advert.id,
+          details: { title: advert.title },
+        });
         return ok("Advert unpublished.", advert);
       })
 
@@ -814,25 +1129,39 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Listings retrieved.", data, meta);
       }, { query: ListingsQuery })
-      .post("/listings/:id/approve", ({ staff, headers, status, params }) => {
+      .post("/listings/:id/approve", async ({ staff, headers, status, params }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
         if (!listing) return status(404, fail("Listing not found."));
         listing.approved = true;
         listing.status = "active";
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "listing.approved",
+          targetType: "listing",
+          targetId: listing.id,
+          details: { title: listing.title },
+        });
         return ok(`Listing "${listing.title}" approved and is now live.`, listing);
       })
-      .post("/listings/:id/reject", ({ staff, headers, status, params, body }) => {
+      .post("/listings/:id/reject", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, STAFF);
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
         if (!listing) return status(404, fail("Listing not found."));
         listing.approved = false;
         listing.status = "inactive";
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "listing.rejected",
+          targetType: "listing",
+          targetId: listing.id,
+          details: { title: listing.title, reason: body.reason },
+        });
         return ok(`Listing "${listing.title}" rejected.`, listing);
       }, { body: ReasonBody })
-      .post("/listings/:id/feature", ({ staff, headers, status, params, body }) => {
+      .post("/listings/:id/feature", async ({ staff, headers, status, params, body }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const listing = store.listings.get(params.id);
@@ -845,6 +1174,13 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
         listing.promoted = featured;
         listing.promotionType = featured ? (body.promotion_type ?? "featured") : null;
         listing.promotionExpiry = expiry;
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: featured ? "listing.featured" : "listing.unfeatured",
+          targetType: "listing",
+          targetId: listing.id,
+          details: { title: listing.title, days: body.days ?? 7 },
+        });
         return ok(
           featured ? "Listing featured." : "Listing removed from featured.",
           listing,
@@ -852,14 +1188,14 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
       }, { body: FeatureBody })
 
       // ── Notification broadcasts (admin only, throttled) ────────────
-      .get("/notifications/broadcasts", ({ staff, headers, status, query }) => {
+      .get("/notifications/broadcasts", async ({ staff, headers, status, query }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
-        const items = [...store.broadcasts].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const items = await broadcastsQueue.list();
         const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
         return ok("Broadcasts retrieved.", { broadcasts: data }, meta);
       }, { query: PaginationQuery })
-      .post("/notifications/broadcast", ({ staff, headers, body, status }) => {
+      .post("/notifications/broadcast", async ({ staff, headers, body, status }) => {
         const denied = staffAccessError(staff, "admin");
         if (denied) return status(denied.status, fail(denied.message));
         const adminId = (staff as StaffUser).id;
@@ -872,7 +1208,12 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           return status(422, fail("user_ids are required when the audience is users."));
         }
 
-        const recipientCount = store.recipientCount(audience, body.role, body.state, body.user_ids);
+        const recipientCount = await broadcastsQueue.recipientCount(
+          audience,
+          body.role,
+          body.state,
+          body.user_ids,
+        );
         const channels = body.channels ?? ["push"];
 
         if (body.dry_run) {
@@ -922,7 +1263,14 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           status: "queued",
           createdAt: nowIso(),
         };
-        store.broadcasts.push(broadcast);
+        await broadcastsQueue.create(broadcast);
+        await logs.log({
+          adminId,
+          action: "broadcast.queued",
+          targetType: "broadcast",
+          targetId: broadcast.id,
+          details: { audience, recipientCount, channels, type: broadcast.type },
+        });
         // TODO(db): dispatch the queued BroadcastNotification job.
         return status(202, ok(`Broadcast queued for ${recipientCount} recipients.`, { broadcast }));
       }, { body: BroadcastBody })

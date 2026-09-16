@@ -59,7 +59,8 @@ import type { ChatStoreLike, ChatMessageRow, SyncMessageInput, PresenceRow } fro
 
 // ── Shared helpers ────────────────────────────────────────────────────────
 
-function toIso(value: Date | string | null | undefined): string | null {
+/** ISO string for a Date/timestamp value (null passthrough). */
+export function toIso(value: Date | string | null | undefined): string | null {
   if (value == null) return null;
   return value instanceof Date ? value.toISOString() : value;
 }
@@ -69,7 +70,11 @@ function toDate(value: string | number | Date | null | undefined): Date | null {
   return value instanceof Date ? value : new Date(value);
 }
 
-function numericUserId(id: string | null | undefined): number | null {
+/**
+ * Public (string) user id → bigint `users.id`. Returns null when the id is
+ * not numeric (test ids like "u1" never reach the DB seam).
+ */
+export function numericUserId(id: string | number | null | undefined): number | null {
   if (id == null) return null;
   const n = Number(id);
   return Number.isSafeInteger(n) ? n : null;

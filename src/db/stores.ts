@@ -60,6 +60,7 @@ import {
   createDbSafetyStore,
   createDbChatStore,
 } from "./stores-engagement";
+import { createDbAdminLogStore } from "./stores-admin";
 
 // Type-only imports — erased at runtime, so stores.ts never participates in a
 // runtime import cycle with the modules that consume these factories.
@@ -79,6 +80,7 @@ import type { AdvertStoreLike } from "../modules/adverts/index";
 import type { ReferralStoreLike } from "../modules/referrals/index";
 import type { SafetyStoreLike } from "../modules/safety/index";
 import type { ChatStoreLike } from "../modules/chat/index";
+import type { AdminLogStoreLike } from "../modules/admin/index";
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -794,6 +796,7 @@ export interface DbStores {
   referrals: ReferralStoreLike;
   safety: SafetyStoreLike;
   chat: ChatStoreLike;
+  adminLogs: AdminLogStoreLike;
 }
 
 const PROBE_TIMEOUT_MS = 3000;
@@ -864,6 +867,7 @@ export function getDbStores(): DbStores | null {
       referrals: createDbReferralStore(),
       safety: createDbSafetyStore(),
       chat: createDbChatStore(),
+      adminLogs: createDbAdminLogStore(),
     };
   }
   return cachedDbStores;
