@@ -40,6 +40,17 @@ export function isMockMode(secret: string = paystackSecret()): boolean {
   return secret.length === 0;
 }
 
+/**
+ * True when no live gateway is available in production (mock mode while
+ * NODE_ENV=production). Routes must fail closed (503) instead of handing
+ * out mock checkout URLs or confirming mock verifications that move no
+ * money. Reads live env like paystackSecret()/isMockMode() so tests can
+ * flip it; env.ts IS_PRODUCTION remains the boot-time canonical.
+ */
+export function isGatewayDisabled(): boolean {
+  return isMockMode() && process.env.NODE_ENV === "production";
+}
+
 export interface InitializeInput {
   email: string;
   /** Amount in kobo (100 kobo = ₦1). */

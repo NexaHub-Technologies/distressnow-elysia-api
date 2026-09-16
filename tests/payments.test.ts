@@ -7,6 +7,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { createHmac } from "node:crypto";
 import {
+  isGatewayDisabled,
   isMockMode,
   mapGatewayStatus,
   initializeTransaction,
@@ -129,6 +130,41 @@ describe("paystack mock mode", () => {
     await expect(
       initializeTransaction({ email: "a@b.com", amountKobo: 9999, reference: "TXN-X" }),
     ).rejects.toThrow();
+  });
+});
+
+describe("production without a gateway secret", () => {
+  const savedNodeEnv = process.env.NODE_ENV;
+
+  beforeEach(() => {
+    clearPaystackSecrets();
+    process.env.NODE_ENV = "production";
+  });
+
+  afterEach(() => {
+    restorePaystackSecrets();
+    if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = savedNodeEnv;
+  });
+
+  test("isGatewayDisabled() is true in production mock mode", () => {
+    expect(isMockMode()).toBe(true);
+    expect(isGatewayDisabled()).toBe(true);
+  });
+
+  test("POST /initialize and POST /verify fail closed with 503", async () => {
+    const users = new MemoryUserStore();
+    const user = await users.create({ name: "Buyer", email: "buyer@example.com" });
+    const auth = { authorization: `Bearer ${await mintJwtToken(SECRET, user.id)}` };
+    const app = createPaymentsPlugin({ store: new MemoryTransactionStore(), users, secret: SECRET });
+
+    const init = await handle(app, json("POST", "/api/v1/payments/initialize", { amount: 500 }, auth));
+    expect(init.status).toBe(503);
+    expect(init.data.success).toBe(false);
+
+    const verify = await handle(app, json("POST", "/api/v1/payments/verify", { reference: "TXN-X" }, auth));
+    expect(verify.status).toBe(503);
+    expect(verify.data.success).toBe(false);
   });
 });
 

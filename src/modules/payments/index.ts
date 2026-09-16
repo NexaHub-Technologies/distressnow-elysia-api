@@ -27,6 +27,7 @@
 import { Elysia, t } from "elysia";
 import {
   initializeTransaction,
+  isGatewayDisabled,
   mapGatewayStatus,
   verifyTransaction,
   verifyWebhookSignature,
@@ -213,6 +214,10 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
       "/initialize",
       async ({ body, currentUser, status }) => {
         if (!currentUser) return status(401, fail("Unauthenticated."));
+        // Fail closed: never hand out mock checkout URLs in production.
+        if (isGatewayDisabled()) {
+          return status(503, fail("Payment gateway is not configured."));
+        }
         const user = currentUser;
         const userEmail = user.email ?? `${user.id}@example.com`;
 
@@ -262,6 +267,10 @@ export function createPaymentsPlugin(options: PaymentsPluginOptions = {}) {
       "/verify",
       async ({ body, currentUser, status }) => {
         if (!currentUser) return status(401, fail("Unauthenticated."));
+        // Fail closed: mock verifications must never confirm payments in production.
+        if (isGatewayDisabled()) {
+          return status(503, fail("Payment gateway is not configured."));
+        }
 
         const transaction = await store.findByReference(body.reference);
         if (!transaction) return status(404, fail("Transaction not found."));

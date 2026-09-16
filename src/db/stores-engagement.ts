@@ -122,11 +122,14 @@ export function createDbTransactionStore(): TransactionStore {
     async create(input: CreateTransactionInput): Promise<TransactionRecord> {
       const userId = numericUserId(input.userId);
       if (userId == null) throw new Error(`Cannot persist transaction: userId "${input.userId}" is not numeric.`);
+      // booking_id arrives as an optional string; only numeric ids fit the
+      // bigint column (a non-numeric value would insert NaN and 500).
+      const bookingNumeric = input.bookingId != null ? Number(input.bookingId) : null;
       const [row] = await db
         .insert(transactions)
         .values({
           userId,
-          bookingId: input.bookingId != null ? Number(input.bookingId) : null,
+          bookingId: bookingNumeric != null && Number.isSafeInteger(bookingNumeric) ? bookingNumeric : null,
           reference: input.reference,
           amount: String(input.amount),
           amountKobo: input.amountKobo,
