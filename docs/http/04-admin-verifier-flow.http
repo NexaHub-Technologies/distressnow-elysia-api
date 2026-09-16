@@ -1,0 +1,624 @@
+### Admin & Verifier Flow
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — create & verify buyer
+###   2. Run 02-provider-flow.http — create provider (need providerId, applicationId from step 1)
+###   3. Run 03-seller-flow.http — create seller (need sellerId, applicationId from step 1)
+###   4. Set seeded IDs in http-client.env.json (adminId, verifierId, shopManagerId)
+###
+### NOTE: Admin module uses x-user-id + x-user-role headers (NOT JWT auth).
+###       The auth token for admin login is set from step 9 of 02-provider-flow.http.
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Admin Authentication
+# ──────────────────────────────────────
+
+### Admin Login
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: {{contentType}}
+
+{
+  "login": "distressnow09@gmail.com",
+  "password": "18781875"
+}
+
+> {%
+  client.test("Admin login returned 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.user.role === "admin", "Expected role: admin");
+    client.global.set("adminAuthToken", response.body.data.token);
+    client.global.set("adminId", response.body.data.user.id);
+    console.log("Admin ID: " + response.body.data.user.id);
+  });
+%}
+
+### Verifier Login
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: {{contentType}}
+
+{
+  "login": "verifier@yopmail.com",
+  "password": "18781875"
+}
+
+> {%
+  client.test("Verifier login returned 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.user.role === "verifier", "Expected role: verifier");
+    client.global.set("verifierAuthToken", response.body.data.token);
+    client.global.set("verifierId", response.body.data.user.id);
+    console.log("Verifier ID: " + response.body.data.user.id);
+  });
+%}
+
+### Shop Manager Login
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: {{contentType}}
+
+{
+  "login": "shop-manager@yopmail.com",
+  "password": "18781875"
+}
+
+> {%
+  client.test("Shop Manager login returned 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.global.set("shopManagerAuthToken", response.body.data.token);
+    client.global.set("shopManagerId", response.body.data.user.id);
+    console.log("Shop Manager ID: " + response.body.data.user.id);
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Dashboard Stats
+# ──────────────────────────────────────
+
+### Admin Dashboard Stats
+GET {{baseUrl}}/api/v1/admin/dashboard/stats
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Dashboard stats returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(typeof response.body.data === "object", "Expected object of stats");
+    console.log("Stats keys: " + Object.keys(response.body.data).join(", "));
+  });
+%}
+
+# ──────────────────────────────────────
+# C. KYC Management
+# ──────────────────────────────────────
+
+### List All KYC Submissions
+GET {{baseUrl}}/api/v1/admin/kyc
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("KYC list returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of KYC submissions");
+  });
+%}
+
+### Approve Provider KYC (Level 1)
+### Uses the KYC ID from 02-provider-flow.http — set kycId before running
+PATCH {{baseUrl}}/api/v1/admin/kyc/{{kycId}}/approve
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "notes": "NIN verified, documents match. Approved for provider application."
+}
+
+> {%
+  client.test("Provider KYC approved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "approved", "Expected status: approved");
+  });
+%}
+
+### Reject KYC (use a test submission or re-submit then reject)
+### For demo: approve then re-submit at a higher level to test rejection flow
+POST {{baseUrl}}/api/v1/kyc
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="level"
+
+2
+--WebAppBoundary
+Content-Disposition: form-data; name="cac_number"
+
+RC12345678
+--WebAppBoundary
+Content-Disposition: form-data; name="smedan_number"
+
+SMED987654
+--WebAppBoundary
+Content-Disposition: form-data; name="business_name"; filename="dummy.png"
+Content-Type: image/png
+
+< ./docs/http/dummy.png
+--WebAppBoundary--
+
+> {%
+  client.test("Level 2 KYC submitted for rejection test", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.global.set("kycId2", response.body.data.id);
+    console.log("KYC ID 2: " + response.body.data.id);
+  });
+%}
+
+### Approve Level 2 KYC
+PATCH {{baseUrl}}/api/v1/admin/kyc/{{kycId2}}/approve
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "notes": "Business documents verified. Level 2 approved for seller application."
+}
+
+> {%
+  client.test("Level 2 KYC approved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Application Management
+# ──────────────────────────────────────
+
+### List Seller Applications
+GET {{baseUrl}}/api/v1/admin/applications/sellers
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Seller applications listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of seller applications");
+  });
+%}
+
+### List Provider Applications
+GET {{baseUrl}}/api/v1/admin/applications/providers
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider applications listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of provider applications");
+  });
+%}
+
+### Approve Provider Application
+### Uses applicationId from 02-provider-flow.http step 1
+PATCH {{baseUrl}}/api/v1/admin/applications/providers/{{applicationId}}
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "status": "approved",
+  "notes": "Provider credentials verified. Application approved."
+}
+
+> {%
+  client.test("Provider application approved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Approve Seller Application
+### Uses sellerApplicationId from 03-seller-flow.http step 1
+PATCH {{baseUrl}}/api/v1/admin/applications/sellers/{{sellerApplicationId}}
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "status": "approved",
+  "notes": "Seller KYC and store details verified. Application approved."
+}
+
+> {%
+  client.test("Seller application approved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# E. User Management
+# ──────────────────────────────────────
+
+### List Users
+GET {{baseUrl}}/api/v1/admin/users
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Users listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of users");
+  });
+%}
+
+### Suspend User (suspend the buyer for testing)
+POST {{baseUrl}}/api/v1/admin/users/{{buyerId}}/suspend
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "reason": "Suspicious activity detected — multiple failed login attempts",
+  "notes": "Automated suspension pending review"
+}
+
+> {%
+  client.test("User suspended", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.suspended === true, "Expected suspended: true");
+  });
+%}
+
+### Unsuspend User
+POST {{baseUrl}}/api/v1/admin/users/{{buyerId}}/unsuspend
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("User unsuspended", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.suspended === false, "Expected suspended: false");
+  });
+%}
+
+### Assign Role (make shop manager an admin for testing, then revert)
+POST {{baseUrl}}/api/v1/admin/users/{{shopManagerId}}/assign-role
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "role": "admin"
+}
+
+> {%
+  client.test("Role assigned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.role === "admin", "Expected role: admin");
+  });
+%}
+
+### Revert Role
+POST {{baseUrl}}/api/v1/admin/users/{{shopManagerId}}/assign-role
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "role": "shop_manager"
+}
+
+> {%
+  client.test("Role reverted to shop_manager", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.role === "shop_manager", "Expected role: shop_manager");
+  });
+%}
+
+# ──────────────────────────────────────
+# F. Market Management
+# ──────────────────────────────────────
+
+### List Markets
+GET {{baseUrl}}/api/v1/admin/markets
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Markets listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of markets");
+  });
+%}
+
+### Create Market
+POST {{baseUrl}}/api/v1/admin/markets
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "name": "Alaba International Market",
+  "state_id": "lagos",
+  "sublocation_id": "oshodi",
+  "description": "West Africa's largest market for electronics, gadgets, and wholesale goods"
+}
+
+> {%
+  client.test("Market created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.global.set("marketId", response.body.data.id);
+    console.log("Market ID: " + response.body.data.id);
+  });
+%}
+
+### Update Market
+PATCH {{baseUrl}}/api/v1/admin/markets/{{marketId}}
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "description": "West Africa's largest market — electronics, gadgets, phone accessories, and wholesale goods. Over 50,000 traders."
+}
+
+> {%
+  client.test("Market updated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Delete Market
+DELETE {{baseUrl}}/api/v1/admin/markets/{{marketId}}
+x-user-id: {{adminId}}
+x-user-role: admin
+
+> {%
+  client.test("Market deleted", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# G. Support Ticket Triage
+# ──────────────────────────────────────
+
+### List All Support Tickets (admin view)
+GET {{baseUrl}}/api/v1/admin/support/tickets
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Admin sees all support tickets", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of tickets");
+  });
+%}
+
+# ──────────────────────────────────────
+# H. Listing Review (admin moderation)
+# ──────────────────────────────────────
+
+### List All Listings (admin view, includes pending)
+GET {{baseUrl}}/api/v1/admin/listings
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Admin sees all listings", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of listings");
+  });
+%}
+
+### Approve Listing
+### Uses listingId from 05-listings-and-search-flow.http
+PATCH {{baseUrl}}/api/v1/admin/listings/{{listingId}}/approve
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Listing approved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Feature Listing
+PATCH {{baseUrl}}/api/v1/admin/listings/{{listingId}}/feature
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Listing featured", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Reject Listing (create a temp listing first, then reject)
+POST {{baseUrl}}/api/v1/listings
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "title": "Suspicious Item — Will Be Rejected",
+  "description": "This listing violates community guidelines and should be removed by admin.",
+  "price": 500,
+  "condition": "used",
+  "state": "lagos",
+  "category": "other"
+}
+
+> {%
+  client.test("Temp listing created for rejection", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.global.set("tempListingId", response.body.data.id);
+  });
+%}
+
+### Reject the Temp Listing
+PATCH {{baseUrl}}/api/v1/admin/listings/{{tempListingId}}/reject
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "reason": "Listing violates community guidelines: prohibited item category"
+}
+
+> {%
+  client.test("Listing rejected", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# I. Advert Management (admin)
+# ──────────────────────────────────────
+
+### List All Adverts (admin view)
+GET {{baseUrl}}/api/v1/admin/adverts
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Admin sees all adverts", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of adverts");
+  });
+%}
+
+### Publish Advert
+### Uses advertId from 10-adverts-referrals-safety-flow.http
+PATCH {{baseUrl}}/api/v1/admin/adverts/{{advertId}}/publish
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Advert published", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Unpublish Advert
+PATCH {{baseUrl}}/api/v1/admin/adverts/{{advertId}}/unpublish
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Advert unpublished", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# J. Broadcast Notifications
+# ──────────────────────────────────────
+
+### Broadcast Notification to All Users
+POST {{baseUrl}}/api/v1/admin/notifications/broadcast
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "title": "System Maintenance Notice",
+  "message": "DistressNow will undergo scheduled maintenance on September 22, 2026 from 2:00 AM to 6:00 AM WAT. Some features may be temporarily unavailable.",
+  "type": "system"
+}
+
+> {%
+  client.test("Notification broadcast sent", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Broadcast Promotional Notification
+POST {{baseUrl}}/api/v1/admin/notifications/broadcast
+x-user-id: {{adminId}}
+x-user-role: admin
+Content-Type: {{contentType}}
+
+{
+  "title": "🎉 New Feature: Chat is Live!",
+  "message": "You can now message providers and sellers directly through the app. Try it out — start a conversation from any provider or store profile.",
+  "type": "promotional"
+}
+
+> {%
+  client.test("Promotional broadcast sent", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# K. Contact Updates Review (admin)
+# ──────────────────────────────────────
+
+### List Contact Updates
+GET {{baseUrl}}/api/v1/admin/contact-updates
+x-user-id: {{adminId}}
+x-user-role: admin
+Accept: {{contentType}}
+
+> {%
+  client.test("Contact updates listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of contact updates");
+  });
+%}

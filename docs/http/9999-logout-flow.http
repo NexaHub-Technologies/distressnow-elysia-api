@@ -1,0 +1,121 @@
+### Logout Flow — All Roles
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — set buyerAuthToken
+###   2. Run 02-provider-flow.http — set providerAuthToken
+###   3. Run 03-seller-flow.http — set sellerAuthToken
+###   4. Run 02-provider-flow.http steps 8-9 — set adminAuthToken, verifierAuthToken
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# Logout each authenticated role
+# ──────────────────────────────────────
+
+### Logout Buyer
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Buyer logged out", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Logout Provider
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Provider logged out", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Logout Seller
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Seller logged out", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Logout Admin
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{adminAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Admin logged out", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Logout Verifier
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{verifierAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Verifier logged out", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# Verify tokens are invalidated
+# ──────────────────────────────────────
+
+### Confirm Buyer Token Invalidated
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Buyer token rejected after logout", function() {
+    client.assert(response.status === 401, "Expected 401 after logout, got " + response.status);
+  });
+%}
+
+### Confirm Provider Token Invalidated
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{providerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider token rejected after logout", function() {
+    client.assert(response.status === 401, "Expected 401 after logout, got " + response.status);
+  });
+%}
+
+### Confirm Admin Token Invalidated
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{adminAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Admin token rejected after logout", function() {
+    client.assert(response.status === 401, "Expected 401 after logout, got " + response.status);
+  });
+%}

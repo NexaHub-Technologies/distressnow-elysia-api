@@ -1,0 +1,456 @@
+### Listings, Search & Catalog Flow
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — set buyerAuthToken, buyerId
+###   2. Run 03-seller-flow.http — set sellerAuthToken, sellerId, storeId
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Catalog (Public, No Auth)
+# ──────────────────────────────────────
+
+### List Categories
+GET {{baseUrl}}/api/v1/catalog/categories
+Accept: {{contentType}}
+
+> {%
+  client.test("Categories returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of categories");
+    if (response.body.data.length > 0) {
+      client.global.set("firstCategoryId", response.body.data[0].id);
+      console.log("First category: " + response.body.data[0].id);
+    }
+  });
+%}
+
+### List States
+GET {{baseUrl}}/api/v1/catalog/locations/states
+Accept: {{contentType}}
+
+> {%
+  client.test("States returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of states");
+    if (response.body.data.length > 0) {
+      client.global.set("firstStateId", response.body.data[0].id);
+      console.log("First state: " + response.body.data[0].id);
+    }
+  });
+%}
+
+### List Markets (Public)
+GET {{baseUrl}}/api/v1/catalog/locations/markets
+Accept: {{contentType}}
+
+> {%
+  client.test("Markets returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of markets");
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Create Listings
+# ──────────────────────────────────────
+
+### Create Regular Listing (as Seller)
+POST {{baseUrl}}/api/v1/listings
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "title": "iPhone 15 Pro Max — 256GB, Space Black",
+  "description": "Barely used iPhone 15 Pro Max in Space Black. 256GB storage, 100% battery health. Comes with original box, charger, and a Spigen case. No scratches or dents. Bought from authorized dealer 3 months ago.",
+  "price": 850000,
+  "condition": "like_new",
+  "state": "lagos",
+  "category": "electronics",
+  "deal_type": "regular"
+}
+
+> {%
+  client.test("Regular listing created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.title.includes("iPhone"), "Expected correct title");
+    client.assert(response.body.data.status === "pending", "Expected status: pending admin review");
+    client.global.set("listingId", response.body.data.id);
+    console.log("Listing ID: " + response.body.data.id);
+  });
+%}
+
+### Create Distress Deal Listing (≥20% discount)
+POST {{baseUrl}}/api/v1/listings
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "title": "🔥 DISTRESS: Samsung 65\" QLED 4K Smart TV — Must Go!",
+  "description": "Moving abroad urgently! Selling my Samsung 65-inch QLED 4K Smart TV at a massive loss. Original price ₦1,200,000. Anti-sound bar included. Perfect working condition, wall mount bracket included.",
+  "price": 900000,
+  "discount_price": 700000,
+  "condition": "like_new",
+  "state": "lagos",
+  "category": "electronics",
+  "deal_type": "distress"
+}
+
+> {%
+  client.test("Distress deal listing created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.deal_type === "distress", "Expected deal_type: distress");
+    client.global.set("distressListingId", response.body.data.id);
+    console.log("Distress listing ID: " + response.body.data.id);
+  });
+%}
+
+### Create Furniture Listing
+POST {{baseUrl}}/api/v1/listings
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "title": "Solid Oak Dining Table — 6 Seater",
+  "description": "Beautiful solid oak dining table, seats 6 comfortably. Minor surface scratches but structurally perfect. Perfect for a family home.",
+  "price": 180000,
+  "condition": "good",
+  "state": "abuja",
+  "category": "furniture",
+  "deal_type": "regular"
+}
+
+> {%
+  client.test("Furniture listing created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.global.set("furnitureListingId", response.body.data.id);
+  });
+%}
+
+# ──────────────────────────────────────
+# C. Upload Listing Images
+# ──────────────────────────────────────
+
+### Upload Listing Image
+POST {{baseUrl}}/api/v1/media/upload
+x-user-id: {{sellerId}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="dummy.png"
+Content-Type: image/png
+
+< ./docs/http/dummy.png
+--WebAppBoundary
+Content-Disposition: form-data; name="folder"
+
+listings
+--WebAppBoundary--
+
+> {%
+  client.test("Listing image uploaded", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.url, "Expected file URL");
+    client.global.set("listingImageUrl", response.body.data.url);
+    console.log("Image URL: " + response.body.data.url);
+  });
+%}
+
+### Upload Second Listing Image
+POST {{baseUrl}}/api/v1/media/upload
+x-user-id: {{sellerId}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="dummy.png"
+Content-Type: image/png
+
+< ./docs/http/dummy.png
+--WebAppBoundary
+Content-Disposition: form-data; name="folder"
+
+listings
+--WebAppBoundary--
+
+> {%
+  client.test("Second listing image uploaded", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.global.set("listingImageUrl2", response.body.data.url);
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Manage Listings
+# ──────────────────────────────────────
+
+### Get Listing Detail
+GET {{baseUrl}}/api/v1/listings/{{listingId}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Listing detail returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.id === listingId, "Expected correct listing");
+  });
+%}
+
+### Update Listing
+PATCH {{baseUrl}}/api/v1/listings/{{listingId}}
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "title": "iPhone 15 Pro Max — 256GB, Space Black (Price Reduced!)",
+  "price": 800000,
+  "description": "Price reduced! Barely used iPhone 15 Pro Max in Space Black. 256GB storage, 100% battery health. Comes with original box, charger, and Spigen case."
+}
+
+> {%
+  client.test("Listing updated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.price === 800000, "Expected updated price");
+  });
+%}
+
+### Promote Listing (Bump 5 Days)
+POST {{baseUrl}}/api/v1/listings/{{listingId}}/promote
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "tier": "bump_5_days"
+}
+
+> {%
+  client.test("Listing promotion initiated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Record Listing Click
+POST {{baseUrl}}/api/v1/listings/{{listingId}}/click
+Accept: {{contentType}}
+
+> {%
+  client.test("Listing click recorded", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Record Listing View
+POST {{baseUrl}}/api/v1/listings/{{listingId}}/view
+Accept: {{contentType}}
+
+> {%
+  client.test("Listing view recorded", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Add Listing to Favorites
+POST {{baseUrl}}/api/v1/listings/{{distressListingId}}/favorite
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Listing favorited", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Remove Listing from Favorites
+DELETE {{baseUrl}}/api/v1/listings/{{distressListingId}}/favorite
+Authorization: Bearer {{buyerAuthToken}}
+
+> {%
+  client.test("Listing unfavorited", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Delete Listing
+DELETE {{baseUrl}}/api/v1/listings/{{furnitureListingId}}
+Authorization: Bearer {{sellerAuthToken}}
+
+> {%
+  client.test("Listing deleted", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# E. Listing Feeds (Public)
+# ──────────────────────────────────────
+
+### Public Listing Feed (default)
+GET {{baseUrl}}/api/v1/listings
+Accept: {{contentType}}
+
+> {%
+  client.test("Public feed returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of listings");
+  });
+%}
+
+### Listing Feed with Category Filter
+GET {{baseUrl}}/api/v1/listings?category=electronics
+Accept: {{contentType}}
+
+> {%
+  client.test("Electronics feed returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Listing Feed with State Filter
+GET {{baseUrl}}/api/v1/listings?state=lagos&sort=newest
+Accept: {{contentType}}
+
+> {%
+  client.test("Lagos listings returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Distress Deals Feed
+GET {{baseUrl}}/api/v1/listings?distress=true
+Accept: {{contentType}}
+
+> {%
+  client.test("Distress deals feed returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Listing Feed with Price Range
+GET {{baseUrl}}/api/v1/listings?category=electronics&min_price=50000&max_price=500000&sort=price_asc
+Accept: {{contentType}}
+
+> {%
+  client.test("Price-filtered feed returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Listing Feed with Pagination
+GET {{baseUrl}}/api/v1/listings?page=1&per_page=5
+Accept: {{contentType}}
+
+> {%
+  client.test("Paginated feed returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# F. Search
+# ──────────────────────────────────────
+
+### Global Search (all types)
+GET {{baseUrl}}/api/v1/search?q=iphone
+Accept: {{contentType}}
+
+> {%
+  client.test("Global search returned results", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(typeof response.body.data === "object", "Expected search results object");
+  });
+%}
+
+### Search Listings Only
+GET {{baseUrl}}/api/v1/search?q=samsung&type=listings
+Accept: {{contentType}}
+
+> {%
+  client.test("Listing search returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Search with Filters
+GET {{baseUrl}}/api/v1/search?q=phone&type=listings&state=lagos&min_price=50000&max_price=1000000&condition=like_new&sort=newest&page=1&per_page=5
+Accept: {{contentType}}
+
+> {%
+  client.test("Filtered search returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Search Stores
+GET {{baseUrl}}/api/v1/search?q=electronics&type=stores
+Accept: {{contentType}}
+
+> {%
+  client.test("Store search returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Search Providers
+GET {{baseUrl}}/api/v1/search?q=plumbing&type=providers
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider search returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# G. Recently Viewed (Buyer)
+# ──────────────────────────────────────
+
+### View a Listing (record view for recently-viewed)
+POST {{baseUrl}}/api/v1/listings/{{listingId}}/view
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("View recorded for recently-viewed test", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+%}
+
+### Get Recently Viewed Listings
+GET {{baseUrl}}/api/v1/listings/recently-viewed
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Recently viewed listings returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of recently viewed listings");
+  });
+%}

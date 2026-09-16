@@ -1,0 +1,146 @@
+### Notifications Flow
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — set buyerAuthToken, buyerId
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Notification Feed
+# ──────────────────────────────────────
+
+### List Notifications (empty on fresh account)
+GET {{baseUrl}}/api/v1/notifications
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Accept: {{contentType}}
+
+> {%
+  client.test("Notifications listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of notifications");
+  });
+%}
+
+### List Notifications with Pagination
+GET {{baseUrl}}/api/v1/notifications?page=1&per_page=10
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Accept: {{contentType}}
+
+> {%
+  client.test("Paginated notifications returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Push Token Management
+# ──────────────────────────────────────
+
+### Register Push Token (FCM)
+POST {{baseUrl}}/api/v1/notifications/push-tokens
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{
+  "token": "fcm-token-buyer-device-abc123def456ghi789jkl012mno345pqr678stu901",
+  "platform": "android",
+  "device_name": "Samsung Galaxy S24 Ultra"
+}
+
+> {%
+  client.test("Push token registered", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Register Second Push Token (APNs)
+POST {{baseUrl}}/api/v1/notifications/push-tokens
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{
+  "token": "apns-token-buyer-device-xyz987wvu654tsr321qpo098nml765kjih432gfe109",
+  "platform": "ios",
+  "device_name": "iPhone 15 Pro"
+}
+
+> {%
+  client.test("iOS push token registered", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# C. Mark Notifications Read
+# ──────────────────────────────────────
+
+### Mark All Notifications Read
+POST {{baseUrl}}/api/v1/notifications/read-all
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("All notifications marked read", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Mark Specific Notification Read
+### Uses notificationId from feed if available
+POST {{baseUrl}}/api/v1/notifications/{{notificationId}}/read
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Specific notification marked read", function() {
+    // This may 404 if no notifications exist yet — that's fine
+    client.assert(response.status === 200 || response.status === 404, "Expected 200 or 404, got " + response.status);
+    if (response.status === 200) {
+      client.assert(response.body.success === true, "Expected success: true");
+    }
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Delete Push Token (logout cleanup)
+# ──────────────────────────────────────
+
+### Delete FCM Push Token
+DELETE {{baseUrl}}/api/v1/notifications/push-tokens/fcm-token-buyer-device-abc123def456ghi789jkl012mno345pqr678stu901
+x-user-id: {{buyerId}}
+x-user-role: buyer
+
+> {%
+  client.test("Push token deleted", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Delete APNs Push Token
+DELETE {{baseUrl}}/api/v1/notifications/push-tokens/apns-token-buyer-device-xyz987wvu654tsr321qpo098nml765kjih432gfe109
+x-user-id: {{buyerId}}
+x-user-role: buyer
+
+> {%
+  client.test("APNs push token deleted", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}

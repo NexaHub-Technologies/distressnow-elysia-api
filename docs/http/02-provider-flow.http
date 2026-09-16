@@ -1,0 +1,249 @@
+# ==============================================================================
+# DistressNow API (Elysia) — Flow 2: Provider Upgrade Flow (Tier 1 Identity KYC)
+#
+# Flow:
+#   1. Register candidate provider user
+#   2. Attempt Provider Application -> Gets HTTP 403 (KYC Required)
+#   3. Submit Tier 1 KYC (NIN + Selfie) -> Status: pending
+#   4. Admin/verifier approves Tier 1 KYC -> User KYC status: approved
+#   5. User re-submits Provider Application -> Status: pending
+#   6. Admin approves Provider Application -> User gains 'provider' role
+#   7. Verify User Profile via /me
+# ==============================================================================
+
+@baseUrl = http://localhost:3000
+# @baseUrl = http://your-remote-host:3000
+
+
+### ----------------------------------------------------------------------------
+### Step 1: Register Candidate Provider User
+### ----------------------------------------------------------------------------
+# @name registerProviderCandidate
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Sam Technician",
+  "email": "providerone@yopmail.com",
+  "password": "password123",
+  "phone": "08055556677"
+}
+
+> {%
+    client.test("Register returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+    client.global.set("provider_token", response.body.data.token);
+%}
+
+### ----------------------------------------------------------------------------
+### Step 2: Attempt Provider Application WITHOUT KYC (Fails with HTTP 403)
+### Note: Elysia applications module requires approved KYC tier >= 1
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/applications/provider
+Authorization: Bearer {{provider_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "full_name": "Sam Electrical Services",
+  "service_categories": ["Electrician", "Generator Repair"],
+  "years_experience": 5,
+  "availability": "immediate",
+  "location_state": "Lagos",
+  "location_sublocation": "Lekki",
+  "contact_phone": "08055556677"
+}
+
+> {%
+    client.test("Provider app without KYC returns 403", function() {
+        client.assert(response.status === 403, "Expected 403, got " + response.status);
+        client.assert(response.body.success === false, "success should be false");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 3: Check Current KYC Status (Returns tier: 0, status: null)
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/kyc/status
+Authorization: Bearer {{provider_token}}
+Accept: application/json
+
+> {%
+    client.test("KYC status returns 200 with null KYC", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.data.tier === 0, "tier should be 0");
+        client.assert(response.body.data.kyc === null, "kyc should be null");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 4: Submit Tier 1 KYC (Identity: NIN Number)
+### Note: In Elysia this is multipart/form-data for file uploads.
+### The field is 'level' (not 'tier' as in the Laravel version).
+### With mock storage (no CLOUDINARY_* keys), files upload to local storage.
+### For the REST client, use multipart/form-data.
+### ----------------------------------------------------------------------------
+# @name submitTier1Kyc
+POST {{baseUrl}}/api/v1/kyc/submit
+Authorization: Bearer {{provider_token}}
+Content-Type: multipart/form-data; boundary=----FormBoundary
+
+------FormBoundary
+Content-Disposition: form-data; name="level"
+
+1
+------FormBoundary
+Content-Disposition: form-data; name="nin_number"
+
+12345678901
+------FormBoundary
+Content-Disposition: form-data; name="nin_front"; filename="nin_front.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary
+Content-Disposition: form-data; name="nin_back"; filename="nin_back.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary
+Content-Disposition: form-data; name="selfie"; filename="selfie.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary--
+
+> {%
+    client.test("KYC submit returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.tier === 1, "tier should be 1");
+        client.assert(response.body.data.status === "pending", "status should be pending");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 5: Admin Login to Review KYC
+### Staff accounts are seeded: admin distressnow09@gmail.com / pw 18781875
+### Note: Elysia login uses { login } (universal identifier) or { email }
+### ----------------------------------------------------------------------------
+# @name adminLoginForKyc
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+Accept: application/json
+
+{
+  "login": "distressnow09@gmail.com",
+  "password": "18781875"
+}
+
+> {%
+    client.test("Admin login returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+    client.global.set("admin_token", response.body.data.token);
+%}
+
+### ----------------------------------------------------------------------------
+### Step 6: Admin Approves Tier 1 KYC
+### Note: Admin routes currently use x-user-id + x-user-role headers.
+### Adjust the user ID to match the seeded admin's DB id.
+### When admin module integrates JWT auth, switch to Authorization: Bearer.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/admin/kyc/{{provider_kyc_id}}/approve
+x-user-id: 1
+x-user-role: admin
+Accept: application/json
+
+> {%
+    client.test("Admin approve KYC returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 7: User Submits Provider Application (Succeeds now that KYC is Approved)
+### Required fields: full_name, service_categories (array), years_experience,
+###                   availability, location_state, location_sublocation, contact_phone
+### Optional: business_name, bio, price_range, response_time
+### availability must be: immediate | scheduled | busy | weekends | unavailable
+### ----------------------------------------------------------------------------
+# @name submitProviderApp
+POST {{baseUrl}}/api/v1/applications/provider
+Authorization: Bearer {{provider_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "full_name": "Sam Electrical Services",
+  "business_name": "SamTech Solutions",
+  "bio": "Certified electrician with 5 years experience in solar and generator setups.",
+  "service_categories": ["Electrician", "Solar & Inverter Installation"],
+  "years_experience": 5,
+  "price_range": "₦10,000 - ₦50,000",
+  "response_time": "Under 30 mins",
+  "availability": "immediate",
+  "location_state": "Lagos",
+  "location_sublocation": "Lekki",
+  "contact_phone": "08055556677"
+}
+
+> {%
+    client.test("Provider application submit returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.status === "pending", "status should be pending");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 8: Check Provider Application Status
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/applications/provider/status
+Authorization: Bearer {{provider_token}}
+Accept: application/json
+
+> {%
+    client.test("Provider application status returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 9: Admin Approves Provider Application
+### Adjust the application ID to match the pending application.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/admin/applications/providers/{{provider_app_id}}/approve
+x-user-id: 1
+x-user-role: admin
+Accept: application/json
+
+> {%
+    client.test("Admin approve provider app returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 10: Verify User Profile now has 'provider' capability
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{provider_token}}
+Accept: application/json
+
+> {%
+    client.test("User profile shows provider role", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        var roles = response.body.data.user.roles;
+        client.assert(roles && roles.includes("provider"), "roles should include 'provider'");
+    });
+    client.global.set("provider_token_confirmed", "{{provider_token}}");
+%}

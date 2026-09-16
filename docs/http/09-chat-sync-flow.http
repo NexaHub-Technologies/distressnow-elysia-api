@@ -1,0 +1,191 @@
+### Chat Sync Flow
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — set buyerAuthToken, buyerId
+###   2. Run 02-provider-flow.http — set providerAuthToken, providerId
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Chat Sync (offline-first message sync)
+# ──────────────────────────────────────
+
+### Sync Messages (Buyer → Provider, text message)
+POST {{baseUrl}}/api/v1/chat/sync
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{
+  "messages": [
+    {
+      "conversation_id": "conv-buyer-provider-001",
+      "client_message_id": "msg-001",
+      "receiver_id": "{{providerId}}",
+      "message": "Hi! I need help with my kitchen plumbing. Are you available this weekend?",
+      "message_type": "text"
+    }
+  ]
+}
+
+> {%
+  client.test("Chat messages synced", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of synced messages");
+    if (response.body.data.length > 0) {
+      client.assert(response.body.data[0].conversation_id === "conv-buyer-provider-001", "Expected correct conversation_id");
+    }
+  });
+%}
+
+### Sync Messages (Provider → Buyer, text reply)
+POST {{baseUrl}}/api/v1/chat/sync
+x-user-id: {{providerId}}
+x-user-role: provider
+Content-Type: {{contentType}}
+
+{
+  "messages": [
+    {
+      "conversation_id": "conv-buyer-provider-001",
+      "client_message_id": "msg-002",
+      "receiver_id": "{{buyerId}}",
+      "message": "Yes, I'm available Saturday morning! What exactly is the issue?",
+      "message_type": "text"
+    }
+  ]
+}
+
+> {%
+  client.test("Provider reply synced", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Sync Messages with Image Attachment
+POST {{baseUrl}}/api/v1/chat/sync
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{
+  "messages": [
+    {
+      "conversation_id": "conv-buyer-provider-001",
+      "client_message_id": "msg-003",
+      "receiver_id": "{{providerId}}",
+      "message": "Here's a photo of the damage",
+      "message_type": "image",
+      "attachment_url": "https://example.com/uploads/chat/photo-leak.jpg"
+    }
+  ]
+}
+
+> {%
+  client.test("Image message synced", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Presence
+# ──────────────────────────────────────
+
+### Update Presence (online)
+POST {{baseUrl}}/api/v1/chat/presence
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Content-Type: {{contentType}}
+
+{
+  "status": "online"
+}
+
+> {%
+  client.test("Presence updated to online", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Get Presence
+GET {{baseUrl}}/api/v1/chat/presence/{{providerId}}
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Accept: {{contentType}}
+
+> {%
+  client.test("Presence retrieved", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# C. Conversations
+# ──────────────────────────────────────
+
+### List Conversations (Buyer)
+GET {{baseUrl}}/api/v1/chat/conversations
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Accept: {{contentType}}
+
+> {%
+  client.test("Buyer conversations listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of conversations");
+  });
+%}
+
+### List Conversations (Provider)
+GET {{baseUrl}}/api/v1/chat/conversations
+x-user-id: {{providerId}}
+x-user-role: provider
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider conversations listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of conversations");
+  });
+%}
+
+### Get Conversation History
+GET {{baseUrl}}/api/v1/chat/conversations/conv-buyer-provider-001
+x-user-id: {{buyerId}}
+x-user-role: buyer
+Accept: {{contentType}}
+
+> {%
+  client.test("Conversation history returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of messages");
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Mark Read
+# ──────────────────────────────────────
+
+### Mark Conversation Read
+POST {{baseUrl}}/api/v1/chat/conversations/conv-buyer-provider-001/read
+x-user-id: {{providerId}}
+x-user-role: provider
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Conversation marked as read", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}

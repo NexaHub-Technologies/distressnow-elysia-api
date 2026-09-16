@@ -1,0 +1,293 @@
+# ==============================================================================
+# DistressNow API (Elysia) — Flow 3: Seller Upgrade Flow (Tier 2 Business KYC)
+#
+# Flow:
+#   1. Register candidate seller user
+#   2. Attempt Seller Application -> Gets HTTP 403 (Tier 2 KYC Required)
+#   3. Submit Tier 2 KYC (Business: NIN + CAC + business details)
+#   4. Admin/verifier approves Tier 2 KYC
+#   5. User submits Seller Application -> Status: pending
+#   6. Admin approves Seller Application -> User gains 'seller' role
+#   7. User creates their store
+# ==============================================================================
+
+@baseUrl = http://localhost:3000
+# @baseUrl = http://your-remote-host:3000
+
+
+### ----------------------------------------------------------------------------
+### Step 1: Register Candidate Seller User
+### ----------------------------------------------------------------------------
+# @name registerSellerCandidate
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Ngozi Seller",
+  "email": "ngoziseller@yopmail.com",
+  "password": "password123",
+  "phone": "08066667788"
+}
+
+> {%
+    client.test("Register seller candidate returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+    client.global.set("seller_token", response.body.data.token);
+%}
+
+### ----------------------------------------------------------------------------
+### Step 2: Attempt Seller Application WITHOUT Tier 2 KYC (Fails with HTTP 403)
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/applications/seller
+Authorization: Bearer {{seller_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "store_name": "Ngozi Fashion Hub",
+  "store_phone": "08066667788",
+  "store_email": "ngoziseller@yopmail.com",
+  "store_state": "Lagos",
+  "store_sublocation": "Lekki",
+  "store_market": "Lekki Market",
+  "store_categories": ["Fashion", "Beauty"]
+}
+
+> {%
+    client.test("Seller app without Tier 2 KYC returns 403", function() {
+        client.assert(response.status === 403, "Expected 403, got " + response.status);
+        client.assert(response.body.success === false, "success should be false");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 3: Submit Tier 2 KYC (Business: NIN + CAC + business details)
+### Note: Tier 2 requires all Tier 1 documents PLUS cac_certificate.
+### The field is 'level' (not 'tier') in the Elysia schema.
+### Business text fields: business_name, business_type, business_address, etc.
+### ----------------------------------------------------------------------------
+# @name submitTier2Kyc
+POST {{baseUrl}}/api/v1/kyc/submit
+Authorization: Bearer {{seller_token}}
+Content-Type: multipart/form-data; boundary=----FormBoundary
+
+------FormBoundary
+Content-Disposition: form-data; name="level"
+
+2
+------FormBoundary
+Content-Disposition: form-data; name="nin_number"
+
+98765432101
+------FormBoundary
+Content-Disposition: form-data; name="business_name"
+
+Ngozi Fashion Hub
+------FormBoundary
+Content-Disposition: form-data; name="business_type"
+
+Retail
+------FormBoundary
+Content-Disposition: form-data; name="business_address"
+
+12 Admiralty Way, Lekki, Lagos
+------FormBoundary
+Content-Disposition: form-data; name="business_phone"
+
+08066667788
+------FormBoundary
+Content-Disposition: form-data; name="business_email"
+
+ngoziseller@yopmail.com
+------FormBoundary
+Content-Disposition: form-data; name="rc_number"
+
+RC-1234567
+------FormBoundary
+Content-Disposition: form-data; name="nin_front"; filename="nin_front.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary
+Content-Disposition: form-data; name="nin_back"; filename="nin_back.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary
+Content-Disposition: form-data; name="selfie"; filename="selfie.png"
+Content-Type: image/png
+
+< ../dummy.png
+------FormBoundary
+Content-Disposition: form-data; name="cac_certificate"; filename="cac.pdf"
+Content-Type: application/pdf
+
+< ../receipt.pdf
+------FormBoundary--
+
+> {%
+    client.test("KYC Tier 2 submit returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.tier === 2, "tier should be 2");
+        client.assert(response.body.data.status === "pending", "status should be pending");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 4: Admin Approves Tier 2 KYC
+### Adjust the user KYC ID to match the pending submission.
+### Admin routes use x-user-id + x-user-role headers (pre-JWT admin integration).
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/admin/kyc/{{seller_kyc_id}}/approve
+x-user-id: 1
+x-user-role: admin
+Accept: application/json
+
+> {%
+    client.test("Admin approve Tier 2 KYC returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 5: User Submits Seller Application
+### Required: store_name, store_phone, store_email, store_state,
+###           store_sublocation, store_market, store_categories (array)
+### Optional: store_description, store_address, store_lat, store_lng, store_logo_url
+### Duplicate pending application -> 409
+### ----------------------------------------------------------------------------
+# @name submitSellerApp
+POST {{baseUrl}}/api/v1/applications/seller
+Authorization: Bearer {{seller_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "store_name": "Ngozi Fashion Hub",
+  "store_description": "Premium fashion and beauty store in Lekki, Lagos.",
+  "store_phone": "08066667788",
+  "store_email": "ngoziseller@yopmail.com",
+  "store_state": "Lagos",
+  "store_sublocation": "Lekki",
+  "store_market": "Lekki Market",
+  "store_categories": ["Fashion", "Beauty"],
+  "store_address": "12 Admiralty Way, Lekki, Lagos"
+}
+
+> {%
+    client.test("Seller application returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.status === "pending", "status should be pending");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 6: Check Seller Application Status
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/applications/seller/status
+Authorization: Bearer {{seller_token}}
+Accept: application/json
+
+> {%
+    client.test("Seller application status returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 7: Admin Approves Seller Application
+### Adjust the application ID to match the pending application.
+### When approved, user gains 'seller' role.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/admin/applications/sellers/{{seller_app_id}}/approve
+x-user-id: 1
+x-user-role: admin
+Accept: application/json
+
+> {%
+    client.test("Admin approve seller app returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 8: Verify User Profile now has 'seller' role
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{seller_token}}
+Accept: application/json
+
+> {%
+    client.test("User has seller role", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        var roles = response.body.data.user.roles;
+        client.assert(roles && roles.includes("seller"), "roles should include 'seller'");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 9: Create Store
+### Required: name
+### Optional: description, phone, email, whatsapp_number, state_id, sublocation_id,
+###           market_id, address, categories (array), social_links (object),
+###           opening_hours (object)
+### NOTE: state_id/sublocation_id/market_id accept UUIDs or slugs from catalog.
+### One store per user -> 422 if already exists.
+### ----------------------------------------------------------------------------
+# @name createStore
+POST {{baseUrl}}/api/v1/stores
+Authorization: Bearer {{seller_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Ngozi Fashion Hub",
+  "description": "Premium fashion and beauty store in Lekki, Lagos.",
+  "phone": "08066667788",
+  "email": "ngoziseller@yopmail.com",
+  "whatsapp_number": "08066667788",
+  "state_id": "Lagos",
+  "sublocation_id": "Lekki",
+  "address": "12 Admiralty Way, Lekki, Lagos",
+  "categories": ["Fashion", "Beauty"],
+  "opening_hours": {
+    "monday": "09:00-18:00",
+    "tuesday": "09:00-18:00",
+    "wednesday": "09:00-18:00",
+    "thursday": "09:00-18:00",
+    "friday": "09:00-18:00",
+    "saturday": "10:00-16:00"
+  }
+}
+
+> {%
+    client.test("Create store returns 201", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.id, "store id should exist");
+    });
+    client.global.set("store_id", response.body.data.id);
+%}
+
+### ----------------------------------------------------------------------------
+### Step 10: Get Own Store
+### ----------------------------------------------------------------------------
+GET {{baseUrl}}/api/v1/user/store
+Authorization: Bearer {{seller_token}}
+Accept: application/json
+
+> {%
+    client.test("Get own store returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.data.id, "store should have id");
+        client.assert(response.body.data.name === "Ngozi Fashion Hub", "store name mismatch");
+    });
+%}

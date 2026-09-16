@@ -7,6 +7,18 @@ Email via **Resend**, SMS/OTP via **Termii**, media via **Cloudinary**, push via
 - API prefix parity: all routes under `/api/v1` — same paths/verbs as Laravel
 - Docs: Swagger at `/docs`, health at `/health`
 
+## Documentation index
+
+| Doc | What's in it |
+|---|---|
+| [docs/API.md](docs/API.md) | API routes & endpoints |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | High-level architecture overview |
+| [docs/DATABASE.md](docs/DATABASE.md) | Postgres data model — 38 tables, enums, indexes, seeding, DB-backed stores |
+| [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) | External services — Termii, Resend, Cloudinary, Expo Push, Paystack |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running & shipping — Docker, migrations, env checklist |
+| [docs/TESTING.md](docs/TESTING.md) | Test strategy — how to run, suite inventory, writing new tests |
+| [docs/http/](docs/http/) | HTTP reference (curl/httpyac examples) |
+
 ## Quickstart
 
 ```bash

@@ -1,0 +1,360 @@
+### Provider Directory, Bookings & Reviews Flow
+### Prerequisites:
+###   1. Run 02-provider-flow.http to create & approve a provider
+###   2. Set providerAuthToken, providerId from 02
+###   3. Set buyerAuthToken, buyerId from 01-auth-and-otp-flow.http
+###   4. Set adminId from 02 (for x-user-id headers)
+###   5. Run 05-listings-and-search-flow.http first to have listings to review
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Provider Directory
+# ──────────────────────────────────────
+
+### List Providers (public)
+GET {{baseUrl}}/api/v1/providers
+Accept: {{contentType}}
+
+> {%
+  client.test("List providers returned 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of providers");
+  });
+%}
+
+### Get Provider Detail
+GET {{baseUrl}}/api/v1/providers/{{providerId}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider detail returned 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Update Provider Profile
+PATCH {{baseUrl}}/api/v1/providers/{{providerId}}
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "bio": "Expert plumbers and pipe fitters with 12+ years experience across Lagos",
+  "service_categories": ["plumbing", "electrical"],
+  "experience_years": 12,
+  "price_range": "₦15,000 – ₦50,000",
+  "response_time": "Within 1 hour",
+  "availability": "immediate",
+  "phone": "+2348012345678",
+  "whatsapp": "+2348098765432",
+  "location_text": "25 Admiralty Way, Lekki Phase 1, Lagos",
+  "skills": ["pipe installation", "leak repair", "water heater installation", "drainage systems", "borehole maintenance"]
+}
+
+> {%
+  client.test("Provider profile updated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Bookings
+# ──────────────────────────────────────
+
+### Create Booking (as Buyer)
+POST {{baseUrl}}/api/v1/bookings
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "service_type": "plumbing",
+  "description": "Kitchen sink is leaking badly, need emergency repair. Water damage spreading to cabinet.",
+  "preferred_date": "2026-09-20",
+  "preferred_time": "10:00",
+  "location_text": "15 Bode Thomas St, Surulere, Lagos",
+  "latitude": 6.4541,
+  "longitude": 3.3947
+}
+
+> {%
+  client.test("Booking created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "pending", "Expected status: pending");
+    client.global.set("bookingId", response.body.data.id);
+    console.log("Booking ID: " + response.body.data.id);
+  });
+%}
+
+### Get Booking Detail
+GET {{baseUrl}}/api/v1/bookings/{{bookingId}}
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Booking detail returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "pending", "Expected status: pending");
+  });
+%}
+
+### List Buyer's Bookings
+GET {{baseUrl}}/api/v1/bookings
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Buyer bookings listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of bookings");
+  });
+%}
+
+### Provider Accepts Booking
+PATCH {{baseUrl}}/api/v1/bookings/{{bookingId}}/status
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "status": "accepted",
+  "quoted_price": 25000
+}
+
+> {%
+  client.test("Booking accepted by provider", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "accepted", "Expected status: accepted");
+    client.assert(response.body.data.quoted_price === 25000, "Expected quoted_price: 25000");
+  });
+%}
+
+### Provider Completes Booking
+PATCH {{baseUrl}}/api/v1/bookings/{{bookingId}}/status
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "status": "completed"
+}
+
+> {%
+  client.test("Booking completed by provider", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "completed", "Expected status: completed");
+  });
+%}
+
+### Create Another Booking (for cancel test)
+POST {{baseUrl}}/api/v1/bookings
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "service_type": "electrical",
+  "description": "Need electrical wiring inspection for a new apartment",
+  "preferred_date": "2026-09-25",
+  "preferred_time": "14:00",
+  "location_text": "42 Allen Avenue, Ikeja, Lagos"
+}
+
+> {%
+  client.test("Second booking created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.global.set("bookingId2", response.body.data.id);
+    console.log("Booking ID 2: " + response.body.data.id);
+  });
+%}
+
+### Provider Accepts Second Booking
+PATCH {{baseUrl}}/api/v1/bookings/{{bookingId2}}/status
+Authorization: Bearer {{providerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "status": "accepted",
+  "quoted_price": 15000
+}
+
+> {%
+  client.test("Second booking accepted", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+%}
+
+### Buyer Cancels Booking
+PATCH {{baseUrl}}/api/v1/bookings/{{bookingId2}}/status
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "status": "cancelled",
+  "reason": "Found someone closer, sorry!"
+}
+
+> {%
+  client.test("Booking cancelled by buyer", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.status === "cancelled", "Expected status: cancelled");
+  });
+%}
+
+# ──────────────────────────────────────
+# C. Reviews
+# ──────────────────────────────────────
+
+### Review Provider (after completed booking)
+POST {{baseUrl}}/api/v1/reviews
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "target_type": "provider",
+  "target_id": "{{providerId}}",
+  "rating": 5,
+  "comment": "Excellent work! Fixed the leak quickly and the price was fair. Highly recommended."
+}
+
+> {%
+  client.test("Provider review created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.rating === 5, "Expected rating: 5");
+    client.global.set("reviewId", response.body.data.id);
+  });
+%}
+
+### Review Listing
+POST {{baseUrl}}/api/v1/reviews
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "target_type": "listing",
+  "target_id": "{{listingId}}",
+  "rating": 4,
+  "comment": "Good quality product, fast delivery. Minor scratches on packaging."
+}
+
+> {%
+  client.test("Listing review created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.rating === 4, "Expected rating: 4");
+  });
+%}
+
+### Review Store
+POST {{baseUrl}}/api/v1/reviews
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "target_type": "store",
+  "target_id": "{{storeId}}",
+  "rating": 5,
+  "comment": "Great store with wide selection. Store owner is very responsive."
+}
+
+> {%
+  client.test("Store review created", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.rating === 5, "Expected rating: 5");
+  });
+%}
+
+### Get Reviews for Provider
+GET {{baseUrl}}/api/v1/reviews?target_type=provider&target_id={{providerId}}
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Provider reviews returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of reviews");
+  });
+%}
+
+### Get Reviews for Listing
+GET {{baseUrl}}/api/v1/reviews?target_type=listing&target_id={{listingId}}
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Listing reviews returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Get Reviews for Store
+GET {{baseUrl}}/api/v1/reviews?target_type=store&target_id={{storeId}}
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Store reviews returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Payments
+# ──────────────────────────────────────
+
+### Initialize Payment
+POST {{baseUrl}}/api/v1/payments/initialize
+x-user-id: {{buyerId}}
+x-user-email: jane.buyer@yopmail.com
+Content-Type: {{contentType}}
+
+{
+  "amount": 25000,
+  "booking_id": "{{bookingId}}",
+  "metadata": {
+    "service": "plumbing",
+    "provider_id": "{{providerId}}"
+  },
+  "callback_url": "http://localhost:3000/api/v1/payments/callback"
+}
+
+> {%
+  client.test("Payment initialized", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.reference, "Expected payment reference");
+    client.assert(response.body.data.authorization_url, "Expected authorization_url (mock)");
+    client.global.set("paymentRef", response.body.data.reference);
+    console.log("Payment reference: " + response.body.data.reference);
+  });
+%}
+
+### Verify Payment
+POST {{baseUrl}}/api/v1/payments/verify
+x-user-id: {{buyerId}}
+x-user-email: jane.buyer@yopmail.com
+Content-Type: {{contentType}}
+
+{
+  "reference": "{{paymentRef}}"
+}
+
+> {%
+  client.test("Payment verified", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    console.log("Payment status: " + response.body.data.status);
+  });
+%}

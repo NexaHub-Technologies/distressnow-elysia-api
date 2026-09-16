@@ -1,106 +1,46 @@
+# DistressNow API (Elysia rebuild) — Development Guide
 
-Default to using Bun instead of Node.js.
+Full repository guidelines live in **`AGENTS.md`** — read it first. This file adds the Bun/CLI conventions that are easy to trip on.
 
-- Use `bun <file>` instead of `node <file>` or `ts-node <file>`
+## Project context
+
+`distressnow-elysia-api` is a **Bun + Elysia + Postgres** port of the Laravel 11 `DistressNowApi`.
+All routes under `/api/v1`, response envelope `{ success, message, data, errors }`, JWT auth,
+DB-backed stores with in-memory fallback, and mock-mode external services (Termii, Resend,
+Cloudinary, Expo Push, Paystack). See `AGENTS.md`, `docs/ARCHITECTURE.md`, and `docs/API.md`.
+
+## Bun conventions (defaults)
+
+- Use `bun <file>` instead of `node <file>` / `ts-node <file>`
 - Use `bun test` instead of `jest` or `vitest`
 - Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
-- Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
-- Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
+- Use `bun install` instead of `npm install` / `yarn` / `pnpm`
+- Use `bun run <script>` instead of `npm run <script>`
 - Use `bunx <package> <command>` instead of `npx <package> <command>`
-- Bun automatically loads .env, so don't use dotenv.
+- Bun automatically loads `.env` — don't use `dotenv`.
+- `package.json` scripts (never use raw `npx tsc`):
+  - `bun run dev` — start with hot reload
+  - `bun run start` — production entry
+  - `bun run db:generate` / `db:push` / `db:migrate` / `db:seed`
+  - `bun test` — test suite
+  - `bunx tsc --noEmit` — typecheck gate (must pass before commit)
 
-## APIs
+## Project gotchas
 
-- `Bun.serve()` supports WebSockets, HTTPS, and routes. Don't use `express`.
-- `bun:sqlite` for SQLite. Don't use `better-sqlite3`.
-- `Bun.redis` for Redis. Don't use `ioredis`.
-- `Bun.sql` for Postgres. Don't use `pg` or `postgres.js`.
-- `WebSocket` is built-in. Don't use `ws`.
-- Prefer `Bun.file` over `node:fs`'s readFile/writeFile
-- Bun.$`ls` instead of execa.
+- **Elysia 1.4**: `error()` is removed from handler context — use `status(code, body)`.
+  `status(201)` alone is a no-op; `status(n, body)` must be returned.
+- **Drizzle**: `.where()` takes a single condition — use `and(...)` for multiple.
+- **Auth guard**: full JWT derive is applied in auth/kyc/applications; several modules
+  (admin, media, payments, chat, notifications, support, adverts, referrals, safety)
+  still use the `x-user-id` / `x-user-role` header stub — migrate to the real guard
+  when the auth plugin can propagate.
+- **DB-backed stores**: `src/db/stores.ts` auto-detects a reachable `DATABASE_URL` at
+  boot and falls back to in-memory stores otherwise. Tests use the in-memory path;
+  live E2E uses Postgres via `bun run dev`.
 
 ## Testing
 
-Use `bun test` to run tests.
-
-```ts#index.test.ts
-import { test, expect } from "bun:test";
-
-test("hello world", () => {
-  expect(1).toBe(1);
-});
-```
-
-## Frontend
-
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
-
-Server:
-
-```ts#index.ts
-import index from "./index.html"
-
-Bun.serve({
-  routes: {
-    "/": index,
-    "/api/users/:id": {
-      GET: (req) => {
-        return new Response(JSON.stringify({ id: req.params.id }));
-      },
-    },
-  },
-  // optional websocket support
-  websocket: {
-    open: (ws) => {
-      ws.send("Hello, world!");
-    },
-    message: (ws, message) => {
-      ws.send(message);
-    },
-    close: (ws) => {
-      // handle close
-    }
-  },
-  development: {
-    hmr: true,
-    console: true,
-  }
-})
-```
-
-HTML files can import .tsx, .jsx or .js files directly and Bun's bundler will transpile & bundle automatically. `<link>` tags can point to stylesheets and Bun's CSS bundler will bundle.
-
-```html#index.html
-<html>
-  <body>
-    <h1>Hello, world!</h1>
-    <script type="module" src="./frontend.tsx"></script>
-  </body>
-</html>
-```
-
-With the following `frontend.tsx`:
-
-```tsx#frontend.tsx
-import React from "react";
-import { createRoot } from "react-dom/client";
-
-// import .css files directly and it works
-import './index.css';
-
-const root = createRoot(document.body);
-
-export default function Frontend() {
-  return <h1>Hello, world!</h1>;
-}
-
-root.render(<Frontend />);
-```
-
-Then, run index.ts
-
-```sh
-bun --hot ./index.ts
-```
-
-For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+- `bun test` — 131 tests / 6 suites (auth, kyc, marketplace, engagement, payments, admin).
+- New features: `bun:test` against the exported `app` from `src/index.ts`
+  (`app.handle()`), inject fresh in-memory stores, assert on the envelope.
+- Live E2E: `npx --yes httpyac docs/http/01-auth-and-otp-flow.http -e local --all`

@@ -1,0 +1,293 @@
+# ==============================================================================
+# DistressNow API (Elysia) — Flow 1: Auth, Login, OTP & Password Reset
+#
+# Extensions:
+#   - VS Code: "REST Client" (humao.rest-client) or "HTTP Client"
+#   - JetBrains / PhpStorm: Built-in HTTP Client
+#
+# Server: Bun + Elysia (port 3000)
+# ==============================================================================
+
+# Choose environment: select 'local' in VS Code status bar (bottom right),
+# or simply toggle the @baseUrl comments below:
+@baseUrl = http://localhost:3000
+# @baseUrl = http://your-remote-host:3000
+
+
+### ----------------------------------------------------------------------------
+### Step 1: Register New Buyer User
+### Note: Elysia register accepts { name, email, password, phone? }
+### No password_confirmation field — the TypeBox schema only requires password.
+### ----------------------------------------------------------------------------
+# @name registerBuyer
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Jane Buyer",
+  "email": "jane.buyer@yopmail.com",
+  "password": "newpassword123",
+  "phone": "08031112234"
+}
+
+> {%
+    client.test("Register returns 201 with token and user", function() {
+        client.assert(response.status === 201, "Expected 201, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.token, "token should exist");
+        client.assert(response.body.data.user.email === "jane.buyer@yopmail.com", "email mismatch");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 2: Login via Email
+### Note: Elysia login body uses { login, email, or phone } + { password }
+### The 'login' field is a universal identifier (email or phone).
+### ----------------------------------------------------------------------------
+# @name emailLogin
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+Accept: application/json
+
+{
+  "login": "jane.buyer@yopmail.com",
+  "password": "newpassword123"
+}
+
+> {%
+    client.test("Login returns 200 with token", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.token, "token should exist");
+        client.assert(response.body.data.user, "user should exist");
+    });
+    client.global.set("buyer_token", response.body.data.token);
+%}
+
+### ----------------------------------------------------------------------------
+### Step 3: Login via Phone & Password
+### ----------------------------------------------------------------------------
+# @name phoneLogin
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+Accept: application/json
+
+{
+  "login": "+2348031112234",
+  "password": "newpassword123"
+}
+
+> {%
+    client.test("Phone login returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.data.token, "token should exist");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 4: Fetch Current User Profile (/me)
+### ----------------------------------------------------------------------------
+# @name getMe
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{buyer_token}}
+Accept: application/json
+
+> {%
+    client.test("GET /me returns 200 with user profile", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.user.email === "jane.buyer@yopmail.com", "email mismatch");
+        client.assert(!response.body.data.user.passwordHash, "passwordHash should be omitted");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 5: Update Profile (Location & Preferences)
+### Note: Elysia PATCH /me accepts name, phone, whatsapp_number,
+###       location_state, location_sublocation, interests, onboarding_completed
+### ----------------------------------------------------------------------------
+# @name updateProfile
+PATCH {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{buyer_token}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "location_state": "Lagos",
+  "location_sublocation": "Ikeja",
+  "interests": ["Electronics", "Home Repairs"],
+  "onboarding_completed": true
+}
+
+> {%
+    client.test("Profile update returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.user.location_state === "Lagos", "location_state mismatch");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 6: Request Phone Signup OTP (Termii SMS)
+### Note: phone_signup for new accounts; phone_reset for password reset
+### In dev/mock mode, the OTP is logged to the console.
+### ----------------------------------------------------------------------------
+# @name sendOtp
+POST {{baseUrl}}/api/v1/auth/otp/send
+Content-Type: application/json
+Accept: application/json
+
+{
+  "phone": "08034445566",
+  "type": "phone_signup"
+}
+
+> {%
+    client.test("OTP send returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 7: Verify Phone OTP & Auto-Create / Login User
+### Note: In dev/mock mode, check server console logs for the generated 6-digit OTP.
+###       Replace 123456 below with the actual code from the logs.
+### ----------------------------------------------------------------------------
+# @name verifyOtp
+POST {{baseUrl}}/api/v1/auth/otp/verify
+Content-Type: application/json
+Accept: application/json
+
+{
+  "phone": "08034445566",
+  "code": "123456",
+  "name": "Phone Verified User"
+}
+
+> {%
+    client.test("OTP verify returns 200/201", function() {
+        client.assert(response.status >= 200 && response.status < 300, "Expected 2xx, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.token, "token should exist");
+        client.assert(response.body.data.is_new !== undefined, "is_new flag should exist");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 8: Password Reset — Check Phone Exists
+### Note: In mock mode the password reset OTP is logged to the server console.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/password/check-phone
+Content-Type: application/json
+Accept: application/json
+
+{
+  "phone": "08031112234"
+}
+
+> {%
+    client.test("Phone check returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+        client.assert(response.body.data.exists === true, "phone should exist");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 9a: Password Reset — Send Reset OTP via Phone
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/password/send-reset
+Content-Type: application/json
+Accept: application/json
+
+{
+  "phone": "08031112234"
+}
+
+> {%
+    client.test("Password reset OTP sent via phone", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.data.via === "phone", "via should be phone");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 9b: Password Reset — Send Reset OTP via Email
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/password/send-reset
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "jane.buyer@yopmail.com"
+}
+
+> {%
+    client.test("Password reset OTP sent via email", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.data.via === "email", "via should be email");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 10a: Password Reset — Submit OTP & New Password (via Phone)
+### Note: 'code' or 'otp' and 'password' or 'new_password' are accepted.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/password/reset
+Content-Type: application/json
+Accept: application/json
+
+{
+  "phone": "08031112234",
+  "otp": "123456",
+  "new_password": "newpassword123"
+}
+
+> {%
+    client.test("Password reset via phone returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 10b: Password Reset — Submit OTP & New Password (via Email)
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/password/reset
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "jane.buyer@yopmail.com",
+  "code": "123456",
+  "password": "newpassword123"
+}
+
+> {%
+    client.test("Password reset via email returns 200", function() {
+        client.assert(response.status === 200, "Expected 200, got " + response.status);
+        client.assert(response.body.success === true, "success should be true");
+    });
+%}
+
+### ----------------------------------------------------------------------------
+### Step 11: Social Login (Google) — stub, requires valid id_token
+### Note: In production this verifies the Google id_token against
+###       oauth2.googleapis.com. The endpoint works but will reject invalid tokens.
+### ----------------------------------------------------------------------------
+POST {{baseUrl}}/api/v1/auth/social/google
+Content-Type: application/json
+Accept: application/json
+
+{
+  "id_token": "invalid-google-token-for-testing"
+}
+
+> {%
+    client.test("Social login with bad token returns 422", function() {
+        client.assert(response.status === 422, "Expected 422, got " + response.status);
+        client.assert(response.body.success === false, "success should be false");
+    });
+%}

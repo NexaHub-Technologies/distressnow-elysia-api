@@ -1,0 +1,196 @@
+### Stores & Follows Flow
+### Prerequisites:
+###   1. Run 01-auth-and-otp-flow.http — set buyerAuthToken, buyerId
+###   2. Run 03-seller-flow.http — set sellerAuthToken, sellerId, storeId
+
+@js { client.global.set("baseUrl", "http://localhost:3000"); }
+
+@contentType = application/json
+
+# ──────────────────────────────────────
+# A. Store Directory
+# ──────────────────────────────────────
+
+### List All Stores (public directory)
+GET {{baseUrl}}/api/v1/stores
+Accept: {{contentType}}
+
+> {%
+  client.test("Store directory returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of stores");
+  });
+%}
+
+### List Stores — Only Active & Verified
+GET {{baseUrl}}/api/v1/stores?status=active&is_verified=true
+Accept: {{contentType}}
+
+> {%
+  client.test("Active verified stores returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of stores");
+  });
+%}
+
+### Get Store Detail
+GET {{baseUrl}}/api/v1/stores/{{storeId}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Store detail returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.id === storeId, "Expected correct store");
+    console.log("Store name: " + response.body.data.name);
+  });
+%}
+
+### Get Store Listings
+GET {{baseUrl}}/api/v1/stores/{{storeId}}/listings
+Accept: {{contentType}}
+
+> {%
+  client.test("Store listings returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of store listings");
+  });
+%}
+
+# ──────────────────────────────────────
+# B. Update Store (as Seller)
+# ──────────────────────────────────────
+
+### Update Store Details
+PATCH {{baseUrl}}/api/v1/stores/{{storeId}}
+Authorization: Bearer {{sellerAuthToken}}
+Content-Type: {{contentType}}
+
+{
+  "description": "Lagos's premier electronics marketplace. We stock phones, laptops, TVs, generators, and home appliances. All products are tested and come with a 30-day warranty.",
+  "whatsapp_number": "+234812345678",
+  "address": "15 Admiralty Way, Lekki Phase 1, Lagos",
+  "categories": ["electronics", "phones", "laptops"],
+  "social_links": {
+    "instagram": "https://instagram.com/janes_electronics",
+    "twitter": "https://twitter.com/janes_electronics",
+    "facebook": "https://facebook.com/janes.electronics.lagos"
+  },
+  "opening_hours": {
+    "monday": "09:00-18:00",
+    "tuesday": "09:00-18:00",
+    "wednesday": "09:00-18:00",
+    "thursday": "09:00-18:00",
+    "friday": "09:00-18:00",
+    "saturday": "10:00-16:00",
+    "sunday": "closed"
+  }
+}
+
+> {%
+  client.test("Store updated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+# ──────────────────────────────────────
+# C. Follow / Unfollow
+# ──────────────────────────────────────
+
+### Follow Store (Buyer follows Seller's store)
+POST {{baseUrl}}/api/v1/stores/{{storeId}}/follow
+Authorization: Bearer {{buyerAuthToken}}
+Content-Type: {{contentType}}
+
+{}
+
+> {%
+  client.test("Store followed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Verify Store Follower Count Increased
+GET {{baseUrl}}/api/v1/stores/{{storeId}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Store follower count updated", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    console.log("Followers: " + (response.body.data.followers_count || response.body.data.followers || "N/A"));
+  });
+%}
+
+### Get Buyer's Following List
+GET {{baseUrl}}/api/v1/stores/following
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Following list returned", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of followed stores");
+  });
+%}
+
+### Unfollow Store
+DELETE {{baseUrl}}/api/v1/stores/{{storeId}}/follow
+Authorization: Bearer {{buyerAuthToken}}
+
+> {%
+  client.test("Store unfollowed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
+
+### Verify Unfollowed
+GET {{baseUrl}}/api/v1/stores/following
+Authorization: Bearer {{buyerAuthToken}}
+Accept: {{contentType}}
+
+> {%
+  client.test("Following list no longer includes store", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    var found = false;
+    if (response.body.data) {
+      response.body.data.forEach(function(s) {
+        if (s.id === storeId) found = true;
+      });
+    }
+    client.assert(!found, "Store should not be in following list after unfollow");
+  });
+%}
+
+# ──────────────────────────────────────
+# D. Provider Directory (Public)
+# ──────────────────────────────────────
+
+### List Verified Providers
+GET {{baseUrl}}/api/v1/providers?is_verified=true
+Accept: {{contentType}}
+
+> {%
+  client.test("Verified providers listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(Array.isArray(response.body.data), "Expected array of providers");
+  });
+%}
+
+### List All Providers (public)
+GET {{baseUrl}}/api/v1/providers
+Accept: {{contentType}}
+
+> {%
+  client.test("All providers listed", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+%}
