@@ -28,6 +28,8 @@ import notificationsApp from "./modules/notifications/index";
 import supportApp from "./modules/support/index";
 import referralsApp from "./modules/referrals/index";
 import safetyApp from "./modules/safety/index";
+import itemRequestsModule from "./modules/item-requests/index";
+import viewTrackingModule from "./modules/view-tracking/index";
 
 export const app = new Elysia()
   .use(cors())
@@ -70,6 +72,8 @@ export const app = new Elysia()
       .use(supportApp)
       .use(referralsApp)
       .use(safetyApp)
+      .use(itemRequestsModule)
+      .use(viewTrackingModule)
       .get("/", () => ok({ version: "v1" }, "DistressNow API v1.")),
   );
 

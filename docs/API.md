@@ -102,24 +102,26 @@ KYC tiers: **Tier 1** (`kyc:1`) unlocks provider applications; **Tier 2** (`kyc:
 | Auth | `/api/v1/auth/*` | 13 |
 | KYC | `/api/v1/kyc/*` | 2 |
 | Applications | `/api/v1/applications/*` | 4 |
-| Admin | `/api/v1/admin/*` | 33 |
+| Admin | `/api/v1/admin/*` | 40 |
 | Media | `/api/v1/media/*` | 1 |
 | Payments | `/api/v1/payments/*` | 3 |
 | Catalog | `/api/v1/categories`, `/api/v1/locations/*` | 3 |
 | Search | `/api/v1/search` | 1 |
 | Listings | `/api/v1/listings/*`, `/api/v1/user/listings`, `/api/v1/user/favorites`, `/api/v1/user/recently-viewed` | 15 |
-| Stores | `/api/v1/stores/*`, `/api/v1/user/store`, `/api/v1/user/following` | 8 |
+| Stores | `/api/v1/stores/*`, `/api/v1/user/store`, `/api/v1/user/stores`, `/api/v1/user/following`, `/api/v1/user/followed-stores` | 16 |
+| View Tracking | `/api/v1/users/:id/view`, `/api/v1/user/profile/analytics`, `/api/v1/providers/:id/view`, `/api/v1/user/providers/:id/analytics` | 4 |
+| Item Requests | `/api/v1/item-requests/*` | 7 |
 | Providers | `/api/v1/providers/*` | 6 |
 | Bookings | `/api/v1/bookings/*` | 3 |
 | Reviews | `/api/v1/reviews` | 2 |
 | Saved searches | `/api/v1/user/saved-searches` | 3 |
 | Adverts | `/api/v1/adverts/*` | 2 |
 | Chat | `/api/v1/chat/*` | 5 |
-| Notifications | `/api/v1/notifications/*` | 5 |
+| Notifications | `/api/v1/notifications/*` | 8 |
 | Support | `/api/v1/support/tickets` | 5 |
 | Referrals | `/api/v1/referrals/*` | 2 |
 | Safety | `/api/v1/reports/safety` | 1 |
-| **Total** | | **119** |
+| **Total** | | **143** |
 
 > **Route-order notes that matter for clients.**
 > - `GET /api/v1/listings/deals` is registered **before** `GET /api/v1/listings/:id` so `deals` is never treated as a UUID.
@@ -750,11 +752,165 @@ Unfollow a store.
 
 ---
 
-#### `GET /api/v1/user/following`
-Stores the authenticated user follows (newest follow first), each decorated with `followed_at`.
+#### `GET /api/v1/stores/counts`
+Nationwide count and breakdown by state/sublocation/market.
+- **Auth:** Public
+- **Query:** `state` (optional), `sublocation` (optional)
+- **Success:** `200` `{ total, states: [{ state_id, state_name, state_slug, count }], sublocations?: [...], markets?: [...] }`
+
+---
+
+#### `GET /api/v1/user/stores`
+List all stores owned by the authenticated user.
+- **Auth:** JWT
+- **Success:** `200` array of store objects with `views_count`, `followers_count`, `is_promoted`.
+
+---
+
+#### `POST /api/v1/stores/:id/view`
+Record a view for a storefront with 5-minute deduplication window per user/IP. Increments store `views_count` and notifies store owner.
+- **Auth:** Optional JWT
+- **Params:** `id` — store UUID
+- **Success:** `200` `{ views_count, throttled: boolean }`
+
+---
+
+#### `GET /api/v1/user/stores/:id/analytics`
+Detailed view and follower analytics for the store owner.
+- **Auth:** JWT (store owner or admin)
+- **Params:** `id` — store UUID
+- **Query:** `page`, `per_page`
+- **Success:** `200` `{ store: { id, name, views_count, followers_count }, recent_viewers: [{ id, viewer, viewed_at }], meta }`
+
+---
+
+#### `POST /api/v1/stores/:id/promote`
+Activate a store promotion package.
+- **Auth:** JWT (store owner or admin)
+- **Params:** `id` — store UUID
+- **Body:** `{ promotion_package: "store_3_days" | "store_5_days" | "store_1_week" | "store_1_month", payment_reference?: string }`
+- **Success:** `200` serialized store object with `is_promoted: true`, `promotion_type`, `promotion_expiry`.
+
+---
+
+#### `GET /api/v1/stores/:id/followers`
+List followers of a specific store.
+- **Auth:** Public
+- **Params:** `id` — store UUID
+- **Query:** `page`, `per_page`
+- **Success:** `200` paginated list of users following the store.
+
+---
+
+#### `POST /api/v1/stores/:id/unfollow`
+Unfollow a store via POST (alias for `DELETE /stores/:id/follow`).
+- **Auth:** JWT
+- **Params:** `id` — store UUID
+- **Success:** `200` `{ followers_count }`
+
+---
+
+#### `GET /api/v1/user/followed-stores`
+List stores the authenticated user follows (alias for `GET /user/following`).
 - **Auth:** JWT
 - **Query:** `page`, `per_page`
-- **Success:** `200` paginated store objects + `followed_at`, standard `meta`.
+- **Success:** `200` paginated store objects + `followed_at`.
+
+---
+
+### 3.7.1 View Tracking — `/api/v1`
+
+#### `POST /api/v1/users/:id/view`
+Record a user profile view with 5-minute deduplication throttle. Increments user `profile_views_count` and sends in-app notice to profile owner.
+- **Auth:** Optional JWT
+- **Params:** `id` — target user ID
+- **Success:** `200` `{ profile_views_count, throttled: boolean }`
+
+---
+
+#### `GET /api/v1/user/profile/analytics`
+Profile view analytics for the authenticated user.
+- **Auth:** JWT
+- **Query:** `page`, `per_page`
+- **Success:** `200` `{ profile_views_count, recent_viewers: [{ id, viewer, viewed_at }], meta }`
+
+---
+
+#### `POST /api/v1/providers/:id/view`
+Record a service provider profile view with 5-minute deduplication throttle. Supports provider UUID, numeric ID, or slug. Increments provider `views_count` and dispatches in-app notice (`service_viewed`) with direct chat link and profile URL to the provider owner.
+- **Auth:** Optional JWT
+- **Params:** `id` — provider UUID, numeric ID, or slug
+- **Success:** `200` `{ views_count, throttled: boolean }`
+
+---
+
+#### `GET /api/v1/user/providers/:id/analytics`
+Service provider view analytics for the provider owner or staff administrator.
+- **Auth:** JWT (Owner or Admin)
+- **Params:** `id` — provider UUID, numeric ID, or slug
+- **Query:** `page`, `per_page`
+- **Success:** `200` `{ provider: { id, uuid, name, views_count }, recent_viewers: [{ id, viewer, viewed_at }], meta }`
+- **Errors:** `403` unauthorized access.
+
+---
+
+### 3.7.2 Item Requests ("Request an Item") — `/api/v1`
+
+#### `GET /api/v1/item-requests/browse`
+Browse open buyer item requests for sellers seeking leads.
+- **Auth:** Public
+- **Query:** `category`, `subcategory`, `state`, `sublocation`, `min_budget`, `max_budget`, `status` (default `open`), `page`, `per_page`
+- **Success:** `200` paginated item requests with `responses_count`, `broadcast_count`, creator user summary.
+
+---
+
+#### `POST /api/v1/item-requests`
+Post a want-ad. Triggers automated two-pool scoring notification engine to candidate sellers (up to 15 promoted + 15 organic stores matching location & category).
+- **Auth:** JWT
+- **Body:** `{ title: string, description: string, category_id?: string|number, subcategory_id?: string|number, state_id?: string|number, sublocation_id?: string|number, budget_min?: number, budget_max?: number, images?: string[] }`
+- **Success:** `201` created item request object with `uuid`, `status: "open"`.
+
+---
+
+#### `GET /api/v1/item-requests/my`
+List all item requests posted by the authenticated buyer.
+- **Auth:** JWT
+- **Query:** `status`, `page`, `per_page`
+- **Success:** `200` paginated user requests with response counts.
+
+---
+
+#### `GET /api/v1/item-requests/offers`
+List all responses/offers received across all item requests owned by the authenticated buyer.
+- **Auth:** JWT
+- **Query:** `page`, `per_page`
+- **Success:** `200` paginated offers with seller store profile and linked listing details.
+
+---
+
+#### `GET /api/v1/item-requests/:id`
+View single item request by UUID or ID with its seller offers.
+- **Auth:** Public (offers only visible to owner or response creator)
+- **Params:** `id` — request UUID or ID
+- **Success:** `200` item request detail with `responses` array.
+
+---
+
+#### `PATCH /api/v1/item-requests/:id/status`
+Update status of an item request.
+- **Auth:** JWT (request creator or admin)
+- **Params:** `id` — request UUID or ID
+- **Body:** `{ status: "open" | "fulfilled" | "cancelled" | "expired" }`
+- **Success:** `200` updated request object.
+
+---
+
+#### `POST /api/v1/item-requests/:id/responses`
+Seller submits an offer response on a buyer's item request. Notifies the buyer.
+- **Auth:** JWT (store owner)
+- **Params:** `id` — request UUID or ID
+- **Body:** `{ price: number, message: string, listing_id?: string|number, images?: string[] }`
+- **Success:** `201` created offer response with seller store details.
 
 ---
 
@@ -887,14 +1043,16 @@ Transition a booking's status. Once `completed`, `cancelled` or `declined` (fina
 
 ### 3.10 Reviews — `/api/v1`
 
+Polymorphic ratings and reviews. Accepts parameter aliases (`reviewable_type` / `target_type` / `type`, and `reviewable_id` / `target_id` / `id`). Supports stores, service providers, listings, and seller/user profiles by UUID, numeric ID, or slug. Automatically recomputes aggregate ratings on stores and service providers, and sends in-app notice (`review_received`) to the owner.
+
 ---
 
 #### `GET /api/v1/reviews`
 List reviews for a target, newest first. Public. Includes an average/total summary in `meta`.
 - **Auth:** Public
 - **Query (required):**
-  - `target_type` (or `reviewable_type` / `type`) — `store | provider | listing`
-  - `target_id` (or `reviewable_id` / `id`) — target UUID
+  - `target_type` (or `reviewable_type` / `type`) — `store | provider | listing | seller | user`
+  - `target_id` (or `reviewable_id` / `id`) — UUID, numeric ID, or slug
   - `page`, `per_page`
 - **Success:** `200` paginated reviews + `meta.average_rating`:
 ```jsonc
@@ -911,11 +1069,12 @@ List reviews for a target, newest first. Public. Includes an average/total summa
 ---
 
 #### `POST /api/v1/reviews`
-Submit a review (one per user per target → `409` duplicate). Store/provider rating aggregates are recomputed on insert.
+Submit a review (one per user per target → `409` duplicate). Store/provider rating aggregates are recomputed on insert, and owner is notified.
 - **Auth:** JWT
 - **Body (JSON):**
-  - `target_type` `string` — `store | provider | listing` **required**
-  - `target_id` `string` (uuid format) **required**
+  - `target_type` (or `reviewable_type` / `type`) `string` — `store | provider | listing | seller | user` **required**
+  - `target_id` (or `reviewable_id` / `id`) `string` — UUID, numeric ID, or slug **required**
+  - `booking_id` `string | number` optional
   - `rating` `integer` 1–5 **required**
   - `comment` `string` (≤2000) optional
 - **Success:** `201` review row ("Review submitted successfully.")
@@ -1038,16 +1197,32 @@ Mark your incoming messages in the thread as read.
 
 ### 3.14 Notifications — `/api/v1/notifications`
 
-In-app notification centre + Expo push-token registry. Account-wide `unread_count` is reported in `meta` regardless of page. Auth is the **header stub** (`x-user-id` defaults to `1`).
+In-app notification centre + Expo push-token registry + user notification preferences. Account-wide `unread_count` is reported in `meta` regardless of page. Protected by real JWT guard (`applyAuthGuard`).
 
 ---
 
 #### `GET /api/v1/notifications`
 Paginated feed (newest first).
-- **Auth:** x-user-ID stub
+- **Auth:** JWT
 - **Query:** `page`, `per_page` (default 20, cap 100), `unread` (`"true"`/`"1"` filters to unread), `type`
 - **Success:** `200` notification rows + `meta` `{ page, per_page, total, total_pages, unread_count }`.
 - Row shape: `{ id, userId, type, title, body, data, read_at, created_at }`.
+
+---
+
+#### `GET /api/v1/notifications/settings`
+Get user notification preferences. Returns defaults merged with saved preferences, providing both `snake_case` and `camelCase` keys for mobile compatibility.
+- **Auth:** JWT
+- **Success:** `200` `{ settings: { push_enabled, pushEnabled, email_enabled, emailEnabled, sms_enabled, smsEnabled, ... } }`.
+
+---
+
+#### `PUT /api/v1/notifications/settings`
+#### `PATCH /api/v1/notifications/settings`
+Update user notification preferences. Accepts `{ settings: { ... } }` or flat settings object.
+- **Auth:** JWT
+- **Body (JSON):** Dictionary of boolean preferences (`push_enabled`, `email_hot_deals`, `push_new_messages`, `view_notifications_push`, etc.)
+- **Success:** `200` `{ message: "Notification preferences updated.", settings: { ... } }`.
 
 ---
 
@@ -1479,6 +1654,61 @@ Queue a push/email/sms broadcast. **Admin only, throttled** (3 per 60 s per admi
   - `dry_run`: `200` `{ dry_run: true, recipient_count, channels }`
   - confirmed: **`202`** `{ broadcast }` ("Broadcast queued for N recipients.")
 - **Errors:** `401`/`403`; `422` missing role/user_ids, no matching recipients, `confirm` not set, SMS over cap; `429` throttled.
+
+---
+
+#### `GET /api/v1/admin/safety-reports`
+Safety report moderation queue.
+- **Auth:** staff (`admin|verifier`)
+- **Query:** `status` (`pending|reviewed|resolved|dismissed|all`), `page`, `per_page`
+- **Success:** `200` paginated safety reports with reporter and reported user relations.
+
+#### `POST /api/v1/admin/safety-reports/:id/resolve`
+Update status of a safety report.
+- **Auth:** staff (`admin|verifier`)
+- **Params:** `id` — report ID or UUID
+- **Body:** `{ status: "reviewed" | "resolved" | "dismissed", action?: string }`
+- **Success:** `200` updated safety report. Notifies reporter of status change.
+
+---
+
+#### `GET /api/v1/admin/stores`
+Storefront approval queue.
+- **Auth:** staff (`admin|verifier`)
+- **Query:** `status` (`pending|active|declined|all`), `page`, `per_page`
+- **Success:** `200` paginated stores list.
+
+#### `POST /api/v1/admin/stores/:id/approve`
+Approve a store profile and activate its storefront.
+- **Auth:** staff (`admin|verifier`)
+- **Params:** `id` — store ID or UUID
+- **Success:** `200` approved store with `status: "active"`, `isVerified: true`. Notifies store owner.
+
+#### `POST /api/v1/admin/stores/:id/decline`
+Decline a store profile with an explanation.
+- **Auth:** staff (`admin|verifier`)
+- **Params:** `id` — store ID or UUID
+- **Body:** `{ reason: string }`
+- **Success:** `200` "Store declined." Notifies store owner with reason.
+
+---
+
+#### `GET /api/v1/admin/settings/sms`
+Inspect active SMS gateway and configuration status.
+- **Auth:** **admin only**
+- **Success:** `200` `{ active_provider: "termii" | "twilio", providers: { termii: { configured, active }, twilio: { configured, active } } }`
+
+#### `PUT /api/v1/admin/settings/sms`
+Update SMS gateway provider and credentials.
+- **Auth:** **admin only**
+- **Body:** `{ provider: "termii" | "twilio", termii_api_key?, termii_sender_id?, termii_base_url?, twilio_account_sid?, twilio_auth_token?, twilio_from_number?, twilio_messaging_service_sid?, twilio_verify_service_sid? }`
+- **Success:** `200` "SMS settings updated successfully."
+
+#### `POST /api/v1/admin/settings/sms/test`
+Send a live test SMS using the active gateway.
+- **Auth:** **admin only**
+- **Body:** `{ phone: string, message?: string }`
+- **Success:** `200` SMS gateway response.
 
 ---
 

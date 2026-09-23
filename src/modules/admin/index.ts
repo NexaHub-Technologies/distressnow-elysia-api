@@ -29,8 +29,14 @@
  * contact_updates).
  */
 import { Elysia, t } from "elysia";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
+import { db as drizzleDb } from "../../db/client";
+import { safetyReports, stores, systemSettings, users } from "../../db/schema";
+import { isUuid } from "../../utils/marketplace";
+import { buildMeta, parsePagination } from "../../utils/pagination";
+import type { PaginationMeta } from "../../utils/response";
 import { applyAuthGuard, type UserStore } from "../auth/index";
-import { pushTokenStore } from "../notifications/index";
+import { notificationStore, pushTokenStore } from "../notifications/index";
 import { dbModeActive, getDbStores } from "../../db/stores";
 import {
   createDbAdvertsAdminQueue,
@@ -49,11 +55,11 @@ import { newId, nowIso } from "../../utils/phone";
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
 
-export function ok<T>(message: string, data: T, meta?: Record<string, unknown>): {
+export function ok<T>(message: string, data: T, meta?: Record<string, unknown> | PaginationMeta): {
   success: true;
   message: string;
   data: T;
-  meta?: Record<string, unknown>;
+  meta?: Record<string, unknown> | PaginationMeta;
 } {
   return { success: true, message, data, ...(meta === undefined ? {} : { meta }) };
 }
@@ -274,6 +280,47 @@ export const SMS_RECIPIENT_CAP = 500;
 export const BROADCAST_THROTTLE_LIMIT = 3;
 export const BROADCAST_THROTTLE_WINDOW_MS = 60_000;
 
+export interface SafetyReportItem {
+  id: string;
+  uuid: string;
+  reporterId: string;
+  reportType: string;
+  message: string;
+  listingId: string | null;
+  reportedUserId: string | null;
+  status: "pending" | "reviewing" | "reviewed" | "resolved" | "dismissed";
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  action: string | null;
+  createdAt: string;
+  updatedAt: string;
+  reporter?: { id: string | number; name: string; email: string | null } | null;
+  reportedUser?: { id: string | number; name: string; email: string | null } | null;
+  listing?: { id: string | number; uuid: string; title: string } | null;
+}
+
+export interface AdminStoreItem {
+  id: string;
+  uuid: string;
+  userId: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  logoPath: string | null;
+  bannerPath: string | null;
+  phone: string | null;
+  email: string | null;
+  status: string;
+  isVerified: boolean;
+  verifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  user?: { id: string | number; name: string; email: string | null; avatarUrl: string | null } | null;
+  state?: { id: number; name: string; slug: string } | null;
+  sublocation?: { id: number; name: string; slug: string } | null;
+  market?: { id: number; name: string; slug: string } | null;
+}
+
 export class AdminStore {
   users = new Map<string, AdminManagedUser>();
   kyc = new Map<string, KycReviewItem>();
@@ -284,6 +331,9 @@ export class AdminStore {
   contactUpdates = new Map<string, ContactUpdateItem>();
   adverts = new Map<string, AdvertItem>();
   listings = new Map<string, ListingReviewItem>();
+  safetyReports = new Map<string, SafetyReportItem>();
+  stores = new Map<string, AdminStoreItem>();
+  systemSettings = new Map<string, string>();
   broadcasts: BroadcastItem[] = [];
   /** Extra aggregate counters with no backing collection in this store. */
   counters = { totalStores: 0, totalProviders: 0, totalTransactions: 0, revenueTotal: 0 };
@@ -299,6 +349,9 @@ export class AdminStore {
     this.contactUpdates.clear();
     this.adverts.clear();
     this.listings.clear();
+    this.safetyReports.clear();
+    this.stores.clear();
+    this.systemSettings.clear();
     this.broadcasts = [];
     this.counters = { totalStores: 0, totalProviders: 0, totalTransactions: 0, revenueTotal: 0 };
     this.broadcastHits.clear();
@@ -1631,6 +1684,428 @@ export function createAdminPlugin(options: AdminPluginOptions = {}) {
           }),
         );
       }, { body: BroadcastBody })
+
+      // ── Safety Reports Review (STAFF) ──────────────────────────────
+      .get("/safety-reports", async ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const targetStatus = query.status ?? "pending";
+
+        if (db) {
+          const conditions = [];
+          if (targetStatus !== "all") {
+            conditions.push(eq(safetyReports.status, targetStatus));
+          }
+          const where = conditions.length > 0 ? and(...conditions) : undefined;
+          const { page, perPage, offset } = parsePagination({ page: query.page, per_page: query.per_page ?? 20 });
+          const [rows, totalRows] = await Promise.all([
+            drizzleDb.select().from(safetyReports).where(where).orderBy(desc(safetyReports.createdAt)).limit(perPage).offset(offset),
+            drizzleDb.select({ total: count() }).from(safetyReports).where(where),
+          ]);
+          const reporterIds = [...new Set(rows.map((r) => r.reporterId))];
+          const reportedUserIds = [...new Set(rows.map((r) => r.reportedUserId).filter((id): id is number => id !== null))];
+          const userIds = [...new Set([...reporterIds, ...reportedUserIds])];
+          const userRows = userIds.length > 0 ? await drizzleDb.select({ id: users.id, name: users.name, email: users.email }).from(users).where(inArray(users.id, userIds)) : [];
+          const userMap = new Map(userRows.map((u) => [u.id, u]));
+
+          const data = rows.map((r) => ({
+            id: r.id,
+            uuid: r.uuid,
+            reporter_id: r.reporterId,
+            report_type: r.reportType,
+            message: r.message,
+            listing_id: r.listingId,
+            reported_user_id: r.reportedUserId,
+            status: r.status,
+            created_at: r.createdAt,
+            reporter: userMap.get(r.reporterId) ?? null,
+            reported_user: r.reportedUserId ? userMap.get(r.reportedUserId) ?? null : null,
+          }));
+          return ok("Safety reports retrieved.", data, buildMeta(page, perPage, totalRows[0]?.total ?? 0));
+        }
+
+        let items = [...store.safetyReports.values()];
+        if (targetStatus !== "all") {
+          items = items.filter((r) => r.status === targetStatus);
+        }
+        items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
+        return ok("Safety reports retrieved.", data, meta);
+      }, {
+        query: t.Object({
+          status: t.Optional(t.String()),
+          page: t.Optional(t.Union([t.String(), t.Number()])),
+          per_page: t.Optional(t.Union([t.String(), t.Number()])),
+        }),
+      })
+      .post("/safety-reports/:id/resolve", async ({ staff, headers, body, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const adminUser = staff as StaffUser;
+        const now = nowIso();
+
+        if (db) {
+          const isParamUuid = isUuid(params.id);
+          const where = isParamUuid
+            ? eq(safetyReports.uuid, params.id)
+            : /^\d+$/.test(params.id)
+              ? eq(safetyReports.id, Number(params.id))
+              : null;
+          if (!where) return status(404, fail("Safety report not found."));
+
+          const existingRows = await drizzleDb.select().from(safetyReports).where(where).limit(1);
+          const report = existingRows[0];
+          if (!report) return status(404, fail("Safety report not found."));
+
+          await drizzleDb
+            .update(safetyReports)
+            .set({
+              status: body.status,
+              updatedAt: new Date(),
+            })
+            .where(eq(safetyReports.id, report.id));
+
+          await logs.log({
+            adminId: adminUser.id,
+            action: "safety_report.resolved",
+            targetType: "safety_report",
+            targetId: String(report.id),
+            details: { status: body.status, action: body.action ?? null },
+          });
+
+          notificationStore.create({
+            userId: String(report.reporterId),
+            type: "announcement",
+            title: "Safety Report Status Update",
+            body: `Your safety report (#${report.id}) has been updated to: ${body.status}.`,
+            data: { report_id: report.id, status: body.status },
+          });
+
+          const updated = (await drizzleDb.select().from(safetyReports).where(eq(safetyReports.id, report.id)).limit(1))[0];
+          return ok("Safety report updated", updated);
+        }
+
+        const report = store.safetyReports.get(params.id) ?? [...store.safetyReports.values()].find((r) => r.uuid === params.id);
+        if (!report) return status(404, fail("Safety report not found."));
+
+        report.status = body.status;
+        report.reviewedBy = adminUser.id;
+        report.reviewedAt = now;
+        report.action = body.action ?? null;
+        report.updatedAt = now;
+
+        await logs.log({
+          adminId: adminUser.id,
+          action: "safety_report.resolved",
+          targetType: "safety_report",
+          targetId: report.id,
+          details: { status: body.status, action: body.action ?? null },
+        });
+
+        notificationStore.create({
+          userId: String(report.reporterId),
+          type: "announcement",
+          title: "Safety Report Status Update",
+          body: `Your safety report (#${report.id}) has been updated to: ${body.status}.`,
+          data: { report_id: report.id, status: body.status },
+        });
+
+        return ok("Safety report updated", report);
+      }, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({
+          status: t.Union([t.Literal("reviewed"), t.Literal("resolved"), t.Literal("dismissed")]),
+          action: t.Optional(t.String()),
+        }),
+      })
+
+      // ── Store Review Queue (STAFF) ──────────────────────────────────
+      .get("/stores", async ({ staff, headers, status, query }) => {
+        const denied = staffAccessError(staff, STAFF);
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const targetStatus = query.status ?? "pending";
+
+        if (db) {
+          const conditions = [];
+          if (targetStatus !== "all") {
+            conditions.push(eq(stores.status, targetStatus));
+          }
+          const where = conditions.length > 0 ? and(...conditions) : undefined;
+          const { page, perPage, offset } = parsePagination({ page: query.page, per_page: query.per_page ?? 20 });
+          const [rows, totalRows] = await Promise.all([
+            drizzleDb.select().from(stores).where(where).orderBy(desc(stores.createdAt)).limit(perPage).offset(offset),
+            drizzleDb.select({ total: count() }).from(stores).where(where),
+          ]);
+          return ok("Stores retrieved.", rows, buildMeta(page, perPage, totalRows[0]?.total ?? 0));
+        }
+
+        let items = [...store.stores.values()];
+        if (targetStatus !== "all") {
+          items = items.filter((s) => s.status === targetStatus);
+        }
+        items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const { data, meta } = paginate(items, query.page ?? 1, query.per_page ?? 20);
+        return ok("Stores retrieved.", data, meta);
+      }, {
+        query: t.Object({
+          status: t.Optional(t.String()),
+          page: t.Optional(t.Union([t.String(), t.Number()])),
+          per_page: t.Optional(t.Union([t.String(), t.Number()])),
+        }),
+      })
+      .post("/stores/:id/approve", async ({ staff, headers, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const adminUser = staff as StaffUser;
+        const now = nowIso();
+
+        if (db) {
+          const isParamUuid = isUuid(params.id);
+          const where = isParamUuid
+            ? eq(stores.uuid, params.id)
+            : /^\d+$/.test(params.id)
+              ? eq(stores.id, Number(params.id))
+              : null;
+          if (!where) return status(404, fail("Store not found."));
+
+          const existingRows = await drizzleDb.select().from(stores).where(where).limit(1);
+          const storeRow = existingRows[0];
+          if (!storeRow) return status(404, fail("Store not found."));
+
+          await drizzleDb
+            .update(stores)
+            .set({
+              status: "active",
+              isVerified: true,
+              verifiedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(stores.id, storeRow.id));
+
+          await logs.log({
+            adminId: adminUser.id,
+            action: "approve_store",
+            targetType: "store",
+            targetId: String(storeRow.id),
+          });
+
+          notificationStore.create({
+            userId: String(storeRow.userId),
+            type: "store_approval",
+            title: "Store approved & active",
+            body: `Your store '${storeRow.name}' has been approved and is now live on DistressNow's open market.`,
+            data: { store_id: storeRow.id, store_uuid: storeRow.uuid },
+          });
+
+          const updated = (await drizzleDb.select().from(stores).where(eq(stores.id, storeRow.id)).limit(1))[0];
+          return ok(`Store '${storeRow.name}' has been approved and activated.`, updated);
+        }
+
+        const storeItem = store.stores.get(params.id) ?? [...store.stores.values()].find((s) => s.uuid === params.id);
+        if (!storeItem) return status(404, fail("Store not found."));
+
+        storeItem.status = "active";
+        storeItem.isVerified = true;
+        storeItem.verifiedAt = now;
+        storeItem.updatedAt = now;
+
+        await logs.log({
+          adminId: adminUser.id,
+          action: "approve_store",
+          targetType: "store",
+          targetId: storeItem.id,
+        });
+
+        notificationStore.create({
+          userId: String(storeItem.userId),
+          type: "store_approval",
+          title: "Store approved & active",
+          body: `Your store '${storeItem.name}' has been approved and is now live on DistressNow's open market.`,
+          data: { store_id: storeItem.id, store_uuid: storeItem.uuid },
+        });
+
+        return ok(`Store '${storeItem.name}' has been approved and activated.`, storeItem);
+      }, { params: t.Object({ id: t.String() }) })
+      .post("/stores/:id/decline", async ({ staff, headers, body, status, params }) => {
+        const denied = staffAccessError(staff, STAFF);
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const adminUser = staff as StaffUser;
+        const now = nowIso();
+
+        if (db) {
+          const isParamUuid = isUuid(params.id);
+          const where = isParamUuid
+            ? eq(stores.uuid, params.id)
+            : /^\d+$/.test(params.id)
+              ? eq(stores.id, Number(params.id))
+              : null;
+          if (!where) return status(404, fail("Store not found."));
+
+          const existingRows = await drizzleDb.select().from(stores).where(where).limit(1);
+          const storeRow = existingRows[0];
+          if (!storeRow) return status(404, fail("Store not found."));
+
+          await drizzleDb
+            .update(stores)
+            .set({
+              status: "declined",
+              updatedAt: new Date(),
+            })
+            .where(eq(stores.id, storeRow.id));
+
+          await logs.log({
+            adminId: adminUser.id,
+            action: "decline_store",
+            targetType: "store",
+            targetId: String(storeRow.id),
+            details: { reason: body.reason },
+          });
+
+          notificationStore.create({
+            userId: String(storeRow.userId),
+            type: "store_decline",
+            title: "Store profile declined",
+            body: `Your store profile '${storeRow.name}' was declined: ${body.reason}`,
+            data: { store_id: storeRow.id, store_uuid: storeRow.uuid, reason: body.reason },
+          });
+
+          return ok(`Store '${storeRow.name}' has been declined.`, null);
+        }
+
+        const storeItem = store.stores.get(params.id) ?? [...store.stores.values()].find((s) => s.uuid === params.id);
+        if (!storeItem) return status(404, fail("Store not found."));
+
+        storeItem.status = "declined";
+        storeItem.updatedAt = now;
+
+        await logs.log({
+          adminId: adminUser.id,
+          action: "decline_store",
+          targetType: "store",
+          targetId: storeItem.id,
+          details: { reason: body.reason },
+        });
+
+        notificationStore.create({
+          userId: String(storeItem.userId),
+          type: "store_decline",
+          title: "Store profile declined",
+          body: `Your store profile '${storeItem.name}' was declined: ${body.reason}`,
+          data: { store_id: storeItem.id, store_uuid: storeItem.uuid, reason: body.reason },
+        });
+
+        return ok(`Store '${storeItem.name}' has been declined.`, null);
+      }, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ reason: t.String({ maxLength: 1000 }) }),
+      })
+
+      // ── SMS Settings (Admin only) ──────────────────────────────────
+      .get("/settings/sms", async ({ staff, headers, status }) => {
+        const denied = staffAccessError(staff, "admin");
+        if (denied) return status(denied.status, fail(denied.message));
+
+        let activeProvider = "termii";
+        let termiiConfigured = Boolean(process.env.TERMII_API_KEY);
+        let twilioConfigured = Boolean(process.env.TWILIO_ACCOUNT_SID);
+
+        if (db) {
+          const settingsRows = await drizzleDb.select().from(systemSettings).where(eq(systemSettings.group, "sms"));
+          for (const s of settingsRows) {
+            if (s.key === "sms_provider") activeProvider = s.value || activeProvider;
+            if (s.key === "termii_api_key") termiiConfigured = Boolean(s.value);
+            if (s.key === "twilio_account_sid") twilioConfigured = Boolean(s.value);
+          }
+        } else {
+          activeProvider = store.systemSettings.get("sms_provider") || activeProvider;
+          if (store.systemSettings.has("termii_api_key")) {
+            termiiConfigured = Boolean(store.systemSettings.get("termii_api_key"));
+          }
+          if (store.systemSettings.has("twilio_account_sid")) {
+            twilioConfigured = Boolean(store.systemSettings.get("twilio_account_sid"));
+          }
+        }
+
+        return ok("SMS settings retrieved.", {
+          active_provider: activeProvider,
+          providers: {
+            termii: { configured: termiiConfigured, active: activeProvider === "termii" },
+            twilio: { configured: twilioConfigured, active: activeProvider === "twilio" },
+          },
+        });
+      })
+      .put("/settings/sms", async ({ staff, headers, body, status }) => {
+        const denied = staffAccessError(staff, "admin");
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const entries: Array<{ key: string; value: string }> = [
+          { key: "sms_provider", value: body.provider },
+        ];
+
+        if (body.termii_api_key) entries.push({ key: "termii_api_key", value: body.termii_api_key });
+        if (body.termii_sender_id) entries.push({ key: "termii_sender_id", value: body.termii_sender_id });
+        if (body.termii_base_url) entries.push({ key: "termii_base_url", value: body.termii_base_url });
+        if (body.twilio_account_sid) entries.push({ key: "twilio_account_sid", value: body.twilio_account_sid });
+        if (body.twilio_auth_token) entries.push({ key: "twilio_auth_token", value: body.twilio_auth_token });
+        if (body.twilio_from_number) entries.push({ key: "twilio_from_number", value: body.twilio_from_number });
+        if (body.twilio_messaging_service_sid) entries.push({ key: "twilio_messaging_service_sid", value: body.twilio_messaging_service_sid });
+        if (body.twilio_verify_service_sid) entries.push({ key: "twilio_verify_service_sid", value: body.twilio_verify_service_sid });
+
+        if (db) {
+          for (const e of entries) {
+            await drizzleDb
+              .insert(systemSettings)
+              .values({ key: e.key, value: e.value, group: "sms" })
+              .onConflictDoUpdate({
+                target: systemSettings.key,
+                set: { value: e.value, updatedAt: new Date() },
+              });
+          }
+        } else {
+          for (const e of entries) {
+            store.systemSettings.set(e.key, e.value);
+          }
+        }
+
+        await logs.log({
+          adminId: (staff as StaffUser).id,
+          action: "settings.sms_updated",
+          targetType: "settings",
+          targetId: "sms",
+          details: { provider: body.provider },
+        });
+
+        return ok("SMS settings updated successfully.", { provider: body.provider });
+      }, {
+        body: t.Object({
+          provider: t.Union([t.Literal("termii"), t.Literal("twilio")]),
+          termii_api_key: t.Optional(t.String()),
+          termii_sender_id: t.Optional(t.String()),
+          termii_base_url: t.Optional(t.String()),
+          twilio_account_sid: t.Optional(t.String()),
+          twilio_auth_token: t.Optional(t.String()),
+          twilio_from_number: t.Optional(t.String()),
+          twilio_messaging_service_sid: t.Optional(t.String()),
+          twilio_verify_service_sid: t.Optional(t.String()),
+        }),
+      })
+      .post("/settings/sms/test", async ({ staff, headers, body, status }) => {
+        const denied = staffAccessError(staff, "admin");
+        if (denied) return status(denied.status, fail(denied.message));
+
+        const res = await sendSms(body.phone, body.message ?? "Test message from DistressNow admin.");
+        return ok("Test SMS sent successfully.", res);
+      }, {
+        body: t.Object({
+          phone: t.String(),
+          message: t.Optional(t.String()),
+        }),
+      })
   );
 }
 

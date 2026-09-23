@@ -2,7 +2,7 @@
 
 The API persists to Postgres through **drizzle-orm + postgres-js**. The schema is defined
 in TypeScript (`src/db/schema.ts`) and mirrors the Laravel reference migrations in
-`DistressNowApi/database/migrations/*.php` table-for-table (38 tables).
+in `DistressNowApi/database/migrations/*.php` table-for-table (44 tables).
 
 ## Connection / client
 
@@ -19,7 +19,7 @@ The pool is memoised on `globalThis.__distressnowSql` (in non-production) so hot
 The connection URL is `DATABASE_URL` (default
 `postgres://postgres:postgres@localhost:5432/distressnow`, see `src/env.ts`).
 
-## Table inventory (38 tables, grouped by domain)
+## Table inventory (44 tables, grouped by domain)
 
 > Conventions carried over from Laravel (see schema header comment):
 > `$table->id()` → `bigserial` PK; a **separate `uuid` column** (`defaultRandom()`,
@@ -32,7 +32,7 @@ The connection URL is `DATABASE_URL` (default
 
 | Table | Purpose / key columns |
 |---|---|
-| `users` | Accounts. `bigserial` PK, **no uuid** — public id is `String(users.id)` (the whole codebase treats user ids as strings, looped through JWT `sub`). Unique `email` and `phone` (varchar 20, stored/queried as E.164 `+234…`), bcrypt `password`, `auth_provider`, `provider_id`, email/phone `*_verified_at`, `onboarding_completed`, `location_state`/`location_sublocation`, `interests` (jsonb). Suspension: `is_suspended`, `suspension_reason`, `suspended_at`, `suspended_by`. Chat presence: `presence_status`, `last_seen_at`, `typing_in_conversation`, `typing_at`. Index: `users_last_seen_at_idx`. |
+| `users` | Accounts. `bigserial` PK, **no uuid** — public id is `String(users.id)` (the whole codebase treats user ids as strings, looped through JWT `sub`). Unique `email` and `phone` (varchar 20, stored/queried as E.164 `+234…`), bcrypt `password`, `auth_provider`, `provider_id`, email/phone `*_verified_at`, `onboarding_completed`, `location_state`/`location_sublocation`, `interests` (jsonb), `notification_settings` (jsonb preferences), `profile_views_count` (bigint). Suspension: `is_suspended`, `suspension_reason`, `suspended_at`, `suspended_by`. Chat presence: `presence_status`, `last_seen_at`, `typing_in_conversation`, `typing_at`. Index: `users_last_seen_at_idx`. |
 | `password_reset_tokens` | Text PK `email` → `token`, `created_at` (Laravel `password_reset_tokens` shape). |
 | `otp_codes` | OTP verification codes. `identifier` + `type` (enum), `code` varchar(10), `expires_at`, `used_at`, `attempts`, `created_at`/`updated_at`. Index: `otp_codes_identifier_type_idx`. Note: the column is `varchar(10)` — too small for the SHA-256 hash the in-memory store keeps, so the **plain 6-digit code** is persisted (Laravel `TermiiService::sendOtp` parity). |
 | `kyc_profiles` | One per user (`user_id` unique FK). `tier` smallint (0 none / 1 identity / 2 business), `status` (`kyc_status` enum: pending/approved/rejected), `rejection_reason`; tier-1 NIN/selfie paths; tier-2 business fields + CAC/SMEDAN paths; review trail (`reviewed_by` FK, `reviewed_at`, `submitted_at`). |
@@ -63,12 +63,22 @@ The connection URL is `DATABASE_URL` (default
 
 | Table | Purpose / key columns |
 |---|---|
-| `stores` | Storefronts: `uuid`, FK `user_id`, unique `slug`, contact info, nullable FKs to `state_id`/`sublocation_id`/`market_id`, `categories`/`social_links`/`opening_hours` (jsonb), counters (`rating`, `review_count`, `listings_count`, `followers_count`), `is_verified`, `status`, `verified_at`, `last_active_at`. Indexes: `stores_state_sublocation_idx`, `stores_verified_status_idx`. |
+| `stores` | Storefronts: `uuid`, FK `user_id`, unique `slug`, contact info, nullable FKs to `state_id`/`sublocation_id`/`market_id`, `categories`/`social_links`/`opening_hours` (jsonb), counters (`rating`, `review_count`, `listings_count`, `followers_count`, `views_count`), promotion fields (`is_promoted`, `promotion_type`, `promoted_at`, `promotion_expiry`), `is_verified`, `status`, `verified_at`, `last_active_at`. Indexes: `stores_state_sublocation_idx`, `stores_verified_status_idx`. |
 | `store_follows` | FK `user_id` + FK `store_id`, unique per user+store (`store_follows_user_store_unique`), index on store. |
-| `service_providers` | Published provider profiles: `uuid`, FK `user_id`, unique `slug`, `service_categories` (jsonb), `availability` (`provider_availability`, distinct 2-value pg type), location FKs, `is_verified`, `rating`, counters. Indexes: `service_providers_state_sublocation_idx`, `service_providers_verified_idx`, `service_providers_availability_idx`. |
+| `store_views` | View analytics for stores: FK `store_id`, optional FK `viewer_id`, `ip_address`, `user_agent`, `viewed_at`. 5-minute throttle prevents duplicate increments within window. Indexes: `store_views_store_viewed_idx`, `store_views_viewer_viewed_idx`. |
+| `profile_views` | View analytics for user profiles: FK `user_id`, optional FK `viewer_id`, `ip_address`, `user_agent`, `viewed_at`. 5-minute throttle prevents duplicate increments. Indexes: `profile_views_user_viewed_idx`, `profile_views_viewer_viewed_idx`. |
+| `service_providers` | Published provider profiles: `uuid`, FK `user_id`, unique `slug`, `service_categories` (jsonb), `availability` (`provider_availability`, distinct 2-value pg type), location FKs, `is_verified`, `rating`, counters (`views_count`, `total_reviews`, `completed_jobs`, `total_services`). Indexes: `service_providers_state_sublocation_idx`, `service_providers_verified_idx`, `service_providers_availability_idx`. |
+| `service_provider_views` | View analytics for service providers: FK `service_provider_id`, optional FK `viewer_id`, `ip_address`, `user_agent`, `viewed_at`. 5-minute throttle prevents duplicate increments within window. Indexes: `service_provider_views_provider_viewed_idx`, `service_provider_views_viewer_viewed_idx`. |
 | `contact_updates` | Pending provider contact-info change requests: FK `provider_id`, `requested_by`, `proposed_changes` (jsonb), `status`, review trail. Index: `contact_updates_status_created_idx`. |
 | `bookings` | Provider bookings: `uuid`, FK `user_id` + `provider_id`, service type/description, `preferred_date`/time, location, `quoted_price`/`final_price` (decimal 12,2), text `status`, cancellation + lifecycle timestamps (`accepted_at`, `started_at`, `completed_at`, `cancelled_at`). Indexes: `bookings_user_status_idx`, `bookings_provider_status_idx`, `bookings_preferred_date_idx`. |
-| `reviews` | Polymorphic rating (Store | ServiceProvider via `reviewable_type`/`reviewable_id`, no FK), optional `booking_id`, `rating` smallint, `comment`, `reply` + `replied_by`/`replied_at`, `uuid`. Indexes: `reviews_reviewable_rating_idx`, `reviews_user_idx`. |
+| `reviews` | Polymorphic rating for Store, ServiceProvider, Listing, and Seller/User via `reviewable_type`/`reviewable_id` (aliases supported), optional `booking_id`, `rating` smallint, `comment`, `reply` + `replied_by`/`replied_at`, `uuid`. Indexes: `reviews_reviewable_rating_idx`, `reviews_user_idx`. |
+
+### Marketplace — Request an Item ("item_requests")
+
+| Table | Purpose / key columns |
+|---|---|
+| `item_requests` | Buyer want-ads: `uuid`, FK `user_id`, `title`, `description`, FKs to `category_id`/`subcategory_id`/`state_id`/`sublocation_id`, `budget_min`/`budget_max` (decimal 12,2), `images` (jsonb), `status` (open, fulfilled, cancelled, expired), `responses_count`, `broadcast_count`, `expires_at`. Matched to sellers via two-pool scoring engine (promoted + organic). Indexes: `item_requests_status_idx`, `item_requests_created_at_idx`, `item_requests_state_status_idx`, `item_requests_category_status_idx`. |
+| `item_request_responses` | Seller offers on buyer item requests: `uuid`, FK `item_request_id` (cascade), FK `store_id` (cascade), FK `user_id` (cascade), `price` (decimal 12,2), `message`, optional FK `listing_id` (set null), `images` (jsonb), `status` (pending, accepted, rejected, expired). Unique per `(item_request_id, store_id)`. Indexes: `item_request_responses_user_idx`, `item_request_responses_store_idx`, `item_request_responses_status_idx`, `item_request_responses_created_at_idx`. |
 
 ### Marketplace — listings
 
@@ -100,16 +110,17 @@ The connection URL is `DATABASE_URL` (default
 |---|---|
 | `support_tickets` | Unique `ticket_number`, FK `user_id`, `subject`, `category` (`ticket_category`), `priority` (`ticket_priority`), `status` (`ticket_status`), `platform` (`ticket_platform`), `last_message`/`last_message_at`, `assigned_to`, `resolved_at`/`closed_at`. Indexes: `support_tickets_user_status_idx`, `support_tickets_status_priority_idx`, `support_tickets_last_message_at_idx`. |
 | `support_messages` | FK `support_ticket_id` (cascade), FK `user_id` (set null), `sender_type` (`sender_type`: user/support/system), `message`, `attachments` (jsonb), `read_at`. Index: `support_messages_ticket_created_idx`. |
-| `adverts` | `uuid`, FK `user_id`, `listing_id` is the **listing uuid without an FK** (mirrors Laravel `foreignUuid`), title/description/image/target, `duration_days` (default 7), `status`, `amount_paid`, `published_at`/`expires_at`. Indexes: `adverts_status_expires_idx`, `adverts_user_idx`. |
+| `adverts` | `uuid`, FK `user_id`, `listing_id` is the **listing uuid without an FK** (mirrors Laravel `foreignUuid`), optional `store_id` (UUID), `placement` (`banner`, `interstitial`), `package_id`, `payment_reference`, title/description/image/target, `duration_days` (default 7), `status`, `amount_paid`, `published_at`/`expires_at`. Indexes: `adverts_status_expires_idx`, `adverts_user_idx`. |
 | `referral_attributions` | `uuid`, FK `user_id` (set null), `referral_code`, `campaign_id`, `status`, FK `registered_user_id`, `metadata` (jsonb), `registered_at`/`converted_at`. Indexes: `referral_attributions_code_idx`, `referral_attributions_status_created_idx`. |
 | `safety_reports` | `uuid`, FK `reporter_id`, `report_type` (varchar 40), `message`, `listing_id` (uuid, no FK), FK `reported_user_id` (set null), `status`. Indexes: `safety_reports_status_created_idx`, `safety_reports_reporter_idx`. |
 
-### Payments / admin / transactions
+### Payments / admin / settings
 
 | Table | Purpose / key columns |
 |---|---|
 | `transactions` | Payment ledger: `uuid`, FK `user_id`, nullable FK `booking_id`, unique `reference` + `paystack_reference`, `amount` decimal(12,2) **and** `amount_kobo` integer, `currency` (varchar 3, default `NGN`), `channel`, `status` (text), `gateway_response`, `ip_address`, `metadata`/`authorization` (jsonb), `paid_at`. Indexes: `transactions_user_status_idx`, `transactions_reference_idx`. |
 | `admin_logs` | Admin audit trail: FK `admin_id`, `action`, `target_type`/`target_id`, `details` (jsonb), `created_at`. Indexes: `admin_logs_admin_created_idx`, `admin_logs_target_idx`. |
+| `system_settings` | Key-value settings table with group categorisation (`general`, `sms`, `payments`): unique `key`, `value` (text), `group`, `created_at`/`updated_at`. Indexes: `system_settings_key_idx`, `system_settings_group_idx`. |
 
 ## Enums (16 `pgEnum` types)
 

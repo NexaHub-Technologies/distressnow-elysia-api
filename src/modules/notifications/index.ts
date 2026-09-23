@@ -18,9 +18,60 @@
 // User ids are strings (see src/db/stores.ts).
 
 import { Elysia, t } from "elysia";
-import { applyAuthGuard, type UserStore } from "../auth/index";
+import { applyAuthGuard, userStore, type UserStore } from "../auth/index";
 import { getDbStores } from "../../db/stores";
 import { DeviceTokenStore, sendPush, type DeviceTokenRegistry } from "../../services/push";
+
+// ── Notification Settings ──────────────────────────────────────────────────
+
+export const DEFAULT_NOTIFICATION_SETTINGS: Record<string, boolean> = {
+  push_enabled: true,
+  email_enabled: true,
+  sms_enabled: true,
+  email_hot_deals: true,
+  email_info_about_ads: true,
+  email_premium_packages: true,
+  email_subscriptions: true,
+  email_messages: true,
+  email_feedback: true,
+  push_new_messages: true,
+  push_new_orders: true,
+  push_price_drops: true,
+  push_new_listings: true,
+  push_promotions: true,
+  sms_order_updates: true,
+  sms_security_alerts: true,
+  view_notifications_push: true,
+  view_notifications_daily_email: true,
+};
+
+export function toSnakeCase(str: string): string {
+  return str.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+export function toCamelCase(str: string): string {
+  return str.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+export function resolveNotificationSettings(
+  saved?: Record<string, unknown> | null,
+): Record<string, boolean> {
+  const normalized: Record<string, boolean> = {};
+  if (saved && typeof saved === "object") {
+    for (const [key, val] of Object.entries(saved)) {
+      normalized[toSnakeCase(key)] = Boolean(val);
+    }
+  }
+  const merged: Record<string, boolean> = {
+    ...DEFAULT_NOTIFICATION_SETTINGS,
+    ...normalized,
+  };
+  for (const key of Object.keys(DEFAULT_NOTIFICATION_SETTINGS)) {
+    const camel = toCamelCase(key);
+    merged[camel] = merged[key] ?? true;
+  }
+  return merged;
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -205,6 +256,76 @@ export function createNotificationsPlugin(options: NotificationsPluginOptions = 
           type: t.Optional(t.String()),
         }),
       },
+    )
+
+    .get("/settings", async ({ currentUser }) => {
+      return ok("Notification preferences retrieved.", {
+        settings: resolveNotificationSettings(currentUser.notification_settings),
+      });
+    })
+
+    .put(
+      "/settings",
+      async ({ body, currentUser, set }) => {
+        const rawPayload = (body as any)?.settings ?? body ?? {};
+        if (
+          typeof rawPayload !== "object" ||
+          rawPayload === null ||
+          Array.isArray(rawPayload)
+        ) {
+          set.status = 422;
+          return fail("Invalid settings format");
+        }
+        const current: Record<string, boolean> = {
+          ...(currentUser.notification_settings ?? {}),
+        };
+        for (const [k, v] of Object.entries(rawPayload)) {
+          const snake = toSnakeCase(k);
+          if (snake in DEFAULT_NOTIFICATION_SETTINGS) {
+            current[snake] = Boolean(v);
+          }
+        }
+        const usersStore = options.users ?? getDbStores()?.users ?? userStore;
+        await usersStore.update(currentUser.id, {
+          notification_settings: current,
+        });
+        return ok("Notification preferences updated.", {
+          settings: resolveNotificationSettings(current),
+        });
+      },
+      { body: t.Any() },
+    )
+
+    .patch(
+      "/settings",
+      async ({ body, currentUser, set }) => {
+        const rawPayload = (body as any)?.settings ?? body ?? {};
+        if (
+          typeof rawPayload !== "object" ||
+          rawPayload === null ||
+          Array.isArray(rawPayload)
+        ) {
+          set.status = 422;
+          return fail("Invalid settings format");
+        }
+        const current: Record<string, boolean> = {
+          ...(currentUser.notification_settings ?? {}),
+        };
+        for (const [k, v] of Object.entries(rawPayload)) {
+          const snake = toSnakeCase(k);
+          if (snake in DEFAULT_NOTIFICATION_SETTINGS) {
+            current[snake] = Boolean(v);
+          }
+        }
+        const usersStore = options.users ?? getDbStores()?.users ?? userStore;
+        await usersStore.update(currentUser.id, {
+          notification_settings: current,
+        });
+        return ok("Notification preferences updated.", {
+          settings: resolveNotificationSettings(current),
+        });
+      },
+      { body: t.Any() },
     )
 
     .post("/push-token", async ({ body, currentUser, set }) => {

@@ -11,16 +11,19 @@
  * - GET    /user/following    stores the user follows (auth)
  */
 import { Elysia, t } from "elysia";
-import { and, count, desc, eq, ilike, or, sql, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, gte, ilike, or, sql, type SQL } from "drizzle-orm";
 import { db } from "../../db/client";
 import {
+  adverts,
   markets,
   states,
   storeFollows,
   stores,
+  storeViews,
   sublocations,
   users,
 } from "../../db/schema";
+import { notificationStore } from "../notifications/index";
 import { auth } from "../../plugins/auth";
 
 type Store = typeof stores.$inferSelect;
@@ -84,6 +87,11 @@ function serializeStore(store: Store, rel: StoreRelations) {
     review_count: store.reviewCount,
     listings_count: store.listingsCount,
     followers_count: store.followersCount,
+    views_count: store.viewsCount ? Number(store.viewsCount) : 0,
+    is_promoted: store.isPromoted ?? false,
+    promotion_type: store.promotionType ?? null,
+    promotion_expiry: store.promotionExpiry ?? null,
+    promoted_at: store.promotedAt ?? null,
     state: store.stateId
       ? (rel.states.get(store.stateId) ?? null)
       : null,
@@ -195,6 +203,109 @@ export const storesModule = new Elysia()
       );
     },
     { query: storeQuerySchema },
+  )
+  .get(
+    "/stores/counts",
+    async ({ query }) => {
+      const activeStores = await db
+        .select({
+          id: stores.id,
+          stateId: stores.stateId,
+          sublocationId: stores.sublocationId,
+          marketId: stores.marketId,
+        })
+        .from(stores)
+        .where(eq(stores.status, "active"));
+
+      const total = activeStores.length;
+      const stateCountsMap = new Map<number, number>();
+      for (const s of activeStores) {
+        if (s.stateId !== null) {
+          stateCountsMap.set(s.stateId, (stateCountsMap.get(s.stateId) ?? 0) + 1);
+        }
+      }
+
+      const allStates = await db
+        .select({ id: states.id, uuid: states.uuid, name: states.name, slug: states.slug })
+        .from(states);
+
+      const statesList = allStates
+        .filter((st) => stateCountsMap.has(st.id))
+        .map((st) => ({
+          state_id: st.id,
+          state_name: st.name,
+          state_slug: st.slug,
+          count: stateCountsMap.get(st.id) ?? 0,
+        }))
+        .sort((a, b) => b.count - a.count);
+
+      const result: Record<string, unknown> = {
+        total,
+        states: statesList,
+      };
+
+      if (query.state) {
+        const stateId = await resolveStateId(query.state);
+        if (stateId) {
+          const stateStores = activeStores.filter((s) => s.stateId === stateId);
+          const subCountsMap = new Map<number, number>();
+          for (const s of stateStores) {
+            if (s.sublocationId !== null) {
+              subCountsMap.set(s.sublocationId, (subCountsMap.get(s.sublocationId) ?? 0) + 1);
+            }
+          }
+          const allSubs = await db
+            .select({ id: sublocations.id, name: sublocations.name, slug: sublocations.slug })
+            .from(sublocations)
+            .where(eq(sublocations.stateId, stateId));
+
+          result.sublocations = allSubs
+            .filter((sub) => subCountsMap.has(sub.id))
+            .map((sub) => ({
+              sublocation_id: sub.id,
+              sublocation_name: sub.name,
+              sublocation_slug: sub.slug,
+              count: subCountsMap.get(sub.id) ?? 0,
+            }))
+            .sort((a, b) => b.count - a.count);
+
+          if (query.sublocation) {
+            const subId = await resolveSublocationId(query.sublocation);
+            if (subId) {
+              const subStores = stateStores.filter((s) => s.sublocationId === subId);
+              const marketCountsMap = new Map<number, number>();
+              for (const s of subStores) {
+                if (s.marketId !== null) {
+                  marketCountsMap.set(s.marketId, (marketCountsMap.get(s.marketId) ?? 0) + 1);
+                }
+              }
+              const allMarkets = await db
+                .select({ id: markets.id, name: markets.name, slug: markets.slug })
+                .from(markets)
+                .where(eq(markets.sublocationId, subId));
+
+              result.markets = allMarkets
+                .filter((m) => marketCountsMap.has(m.id))
+                .map((m) => ({
+                  market_id: m.id,
+                  market_name: m.name,
+                  market_slug: m.slug,
+                  count: marketCountsMap.get(m.id) ?? 0,
+                }))
+                .sort((a, b) => b.count - a.count);
+            }
+          }
+        }
+      }
+
+      return ok(result);
+    },
+    {
+      query: t.Object({
+        state: t.Optional(t.String()),
+        sublocation: t.Optional(t.String()),
+      }),
+    },
   )
   .get(
     "/stores/:id",
@@ -368,6 +479,217 @@ export const storesModule = new Elysia()
     const rel = await loadStoreRelations([store]);
     return ok(serializeStore(store, rel));
   })
+  .get("/user/stores", async ({ currentUser, set }) => {
+    if (!currentUser) {
+      set.status = 401;
+      return fail("Unauthenticated.");
+    }
+    const rows = await db
+      .select()
+      .from(stores)
+      .where(eq(stores.userId, currentUser.id))
+      .orderBy(desc(stores.createdAt));
+    const rel = await loadStoreRelations(rows);
+    return ok(rows.map((s) => serializeStore(s, rel)));
+  })
+  .post(
+    "/stores/:id/promote",
+    async ({ params, body, currentUser, userRoles, set }) => {
+      if (!currentUser) {
+        set.status = 401;
+        return fail("Unauthenticated.");
+      }
+      const store = await findStoreByUuid(params.id);
+      if (!store) {
+        set.status = 404;
+        return fail("Store not found.");
+      }
+      if (store.userId !== currentUser.id && !userRoles.includes("admin")) {
+        set.status = 403;
+        return fail("Unauthorized.");
+      }
+
+      const packageConfig: Record<string, { days: number; amount: number }> = {
+        store_3_days: { days: 3, amount: 3000 },
+        "3_days": { days: 3, amount: 3000 },
+        store_5_days: { days: 5, amount: 5000 },
+        "5_days": { days: 5, amount: 5000 },
+        store_1_week: { days: 7, amount: 7500 },
+        "7_days": { days: 7, amount: 7500 },
+        store_1_month: { days: 30, amount: 25000 },
+        "30_days": { days: 30, amount: 25000 },
+      };
+
+      const pkg = packageConfig[body.promotion_package] ?? { days: 7, amount: 7500 };
+      const now = new Date();
+      const expiry = new Date(now.getTime() + pkg.days * 24 * 60 * 60 * 1000);
+
+      await db
+        .update(stores)
+        .set({
+          status: "active",
+          isPromoted: true,
+          promotionType: body.promotion_package,
+          promotedAt: now,
+          promotionExpiry: expiry,
+        })
+        .where(eq(stores.id, store.id));
+
+      await db.insert(adverts).values({
+        userId: currentUser.id,
+        storeId: store.uuid,
+        title: store.name,
+        description: store.description,
+        imagePath: store.bannerPath ?? store.logoPath,
+        targetUrl: `/store/${store.uuid}`,
+        placement: "banner",
+        packageId: body.promotion_package,
+        durationDays: pkg.days,
+        amountPaid: String(pkg.amount),
+        paymentReference: body.payment_reference ?? null,
+        status: "active",
+        publishedAt: now,
+        expiresAt: expiry,
+      });
+
+      const updated = await findStoreByUuid(params.id);
+      const rel = await loadStoreRelations([updated!]);
+      return ok(serializeStore(updated!, rel), "Store promoted successfully.");
+    },
+    {
+      params: uuidParams,
+      body: t.Object({
+        promotion_package: t.String(),
+        payment_reference: t.Optional(t.String()),
+      }),
+    },
+  )
+  .post(
+    "/stores/:id/view",
+    async ({ params, currentUser, request, set }) => {
+      const store = await findStoreByUuid(params.id);
+      if (!store) {
+        set.status = 404;
+        return fail("Store not found.");
+      }
+
+      const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
+      const userAgent = request.headers.get("user-agent") || "";
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+      const recent = await db
+        .select({ id: storeViews.id })
+        .from(storeViews)
+        .where(
+          and(
+            eq(storeViews.storeId, store.id),
+            currentUser
+              ? eq(storeViews.viewerId, currentUser.id)
+              : eq(storeViews.ipAddress, ip),
+            gte(storeViews.viewedAt, fiveMinutesAgo),
+          ),
+        )
+        .limit(1);
+
+      let currentViews = store.viewsCount ? Number(store.viewsCount) : 0;
+
+      if (!recent[0]) {
+        await db.insert(storeViews).values({
+          storeId: store.id,
+          viewerId: currentUser ? currentUser.id : null,
+          ipAddress: ip,
+          userAgent,
+          viewedAt: new Date(),
+        });
+
+        const updated = await db
+          .update(stores)
+          .set({ viewsCount: sql`${stores.viewsCount} + 1` })
+          .where(eq(stores.id, store.id))
+          .returning({ viewsCount: stores.viewsCount });
+
+        currentViews = updated[0]?.viewsCount ? Number(updated[0].viewsCount) : currentViews + 1;
+
+        if (currentUser && store.userId !== currentUser.id) {
+          notificationStore.create({
+            userId: String(store.userId),
+            type: "store_viewed",
+            title: "Store View Notice",
+            body: `${currentUser.name} viewed your store '${store.name}'.`,
+            data: {
+              store_id: store.id,
+              store_uuid: store.uuid,
+              store_name: store.name,
+              target_type: "store",
+              target_id: store.uuid || store.id,
+              target_name: store.name,
+              viewer_id: currentUser.id,
+              viewer_name: currentUser.name,
+              viewer_avatar: (currentUser as any).avatar_url ?? null,
+              chat_link: `/chat?recipient_id=${currentUser.id}`,
+              profile_url: `/user/${currentUser.id}`,
+            },
+          });
+        }
+      }
+
+      return ok({ views_count: currentViews, throttled: Boolean(recent[0]) }, "Store view recorded");
+    },
+    { params: uuidParams },
+  )
+  .get(
+    "/user/stores/:id/analytics",
+    async ({ params, currentUser, userRoles, query, set }) => {
+      if (!currentUser) {
+        set.status = 401;
+        return fail("Unauthenticated.");
+      }
+      const store = await findStoreByUuid(params.id);
+      if (!store) {
+        set.status = 404;
+        return fail("Store not found.");
+      }
+      if (store.userId !== currentUser.id && !userRoles.includes("admin")) {
+        set.status = 403;
+        return fail("Unauthorized access to store analytics");
+      }
+
+      const { page, perPage, offset } = parsePagination(query);
+      const where = and(eq(storeViews.storeId, store.id), sql`${storeViews.viewerId} IS NOT NULL`);
+      const [viewRows, totalRows] = await Promise.all([
+        db
+          .select()
+          .from(storeViews)
+          .where(where)
+          .orderBy(desc(storeViews.viewedAt))
+          .limit(perPage)
+          .offset(offset),
+        db.select({ total: count() }).from(storeViews).where(where),
+      ]);
+
+      const viewerIds = [...new Set(viewRows.map((v) => v.viewerId).filter((id): id is number => id !== null))];
+      const viewerRows = viewerIds.length > 0 ? await db.select({ id: users.id, name: users.name, email: users.email, avatarPath: users.avatarPath }).from(users) : [];
+      const viewerMap = new Map(viewerRows.map((u) => [u.id, u]));
+
+      const recentViewers = viewRows.map((v) => ({
+        id: v.id,
+        viewer: v.viewerId ? viewerMap.get(v.viewerId) ?? { id: v.viewerId } : null,
+        viewed_at: v.viewedAt,
+      }));
+
+      return ok({
+        store: {
+          id: store.uuid,
+          name: store.name,
+          views_count: store.viewsCount ? Number(store.viewsCount) : 0,
+          followers_count: store.followersCount,
+        },
+        recent_viewers: recentViewers,
+        meta: buildMeta(page, perPage, totalRows[0]?.total ?? 0),
+      });
+    },
+    { params: uuidParams, query: pageQuerySchema },
+  )
   .post(
     "/stores/:id/follow",
     async ({ params, currentUser, set }) => {
@@ -440,8 +762,96 @@ export const storesModule = new Elysia()
     },
     { params: uuidParams },
   )
+  .post(
+    "/stores/:id/unfollow",
+    async ({ params, currentUser, set }) => {
+      if (!currentUser) {
+        set.status = 401;
+        return fail("Unauthenticated.");
+      }
+      const store = await findStoreByUuid(params.id);
+      if (!store) {
+        set.status = 404;
+        return fail("Store not found.");
+      }
+      const existing = await db
+        .select({ id: storeFollows.id })
+        .from(storeFollows)
+        .where(and(eq(storeFollows.userId, currentUser.id), eq(storeFollows.storeId, store.id)))
+        .limit(1);
+      const follow = existing[0];
+      if (!follow) {
+        set.status = 404;
+        return fail("You are not following this store.");
+      }
+      await db.delete(storeFollows).where(eq(storeFollows.id, follow.id));
+      const lowered = await db
+        .update(stores)
+        .set({ followersCount: sql`GREATEST(${stores.followersCount} - 1, 0)` })
+        .where(eq(stores.id, store.id))
+        .returning({ followersCount: stores.followersCount });
+      return ok(
+        { followers_count: lowered[0]?.followersCount ?? 0 },
+        "Store unfollowed.",
+      );
+    },
+    { params: uuidParams },
+  )
+  .get(
+    "/stores/:id/followers",
+    async ({ params, query, set }) => {
+      const store = await findStoreByUuid(params.id);
+      if (!store) {
+        set.status = 404;
+        return fail("Store not found.");
+      }
+      const { page, perPage, offset } = parsePagination(query);
+      const where = eq(storeFollows.storeId, store.id);
+      const [followRows, totalRows] = await Promise.all([
+        db.select().from(storeFollows).where(where).orderBy(desc(storeFollows.createdAt)).limit(perPage).offset(offset),
+        db.select({ total: count() }).from(storeFollows).where(where),
+      ]);
+      const userIds = [...new Set(followRows.map((f) => f.userId))];
+      const userRows = userIds.length > 0 ? await db.select({ id: users.id, name: users.name, email: users.email, avatarPath: users.avatarPath }).from(users) : [];
+      const userMap = new Map(userRows.map((u) => [u.id, u]));
+
+      const data = followRows.map((f) => ({
+        user: userMap.get(f.userId) ?? { id: f.userId },
+        created_at: f.createdAt,
+      }));
+      return paginated(data, buildMeta(page, perPage, totalRows[0]?.total ?? 0));
+    },
+    { params: uuidParams, query: pageQuerySchema },
+  )
   .get(
     "/user/following",
+    async ({ currentUser, query, set }) => {
+      if (!currentUser) {
+        set.status = 401;
+        return fail("Unauthenticated.");
+      }
+      const { page, perPage, offset } = parsePagination(query);
+      const where = eq(storeFollows.userId, currentUser.id);
+      const [follows, totalRows] = await Promise.all([
+        db.select().from(storeFollows).where(where).orderBy(desc(storeFollows.createdAt)).limit(perPage).offset(offset),
+        db.select({ total: count() }).from(storeFollows).where(where),
+      ]);
+      const storeIds = [...new Set(follows.map((f) => f.storeId))];
+      const storeRows = await db.select().from(stores);
+      const wanted = new Set(storeIds);
+      const matched = storeRows.filter((s) => wanted.has(s.id));
+      const rel = await loadStoreRelations(matched);
+      const followedAtByStore = new Map(follows.map((f) => [f.storeId, f.createdAt]));
+      const data = matched.map((store) => ({
+        ...serializeStore(store, rel),
+        followed_at: followedAtByStore.get(store.id) ?? null,
+      }));
+      return paginated(data, buildMeta(page, perPage, totalRows[0]?.total ?? 0));
+    },
+    { query: pageQuerySchema },
+  )
+  .get(
+    "/user/followed-stores",
     async ({ currentUser, query, set }) => {
       if (!currentUser) {
         set.status = 401;

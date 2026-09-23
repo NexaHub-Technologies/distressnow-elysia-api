@@ -73,6 +73,8 @@ export interface AuthUser {
   location_sublocation: string | null;
   interests: string[] | null;
   onboarding_completed: boolean;
+  notification_settings?: Record<string, boolean> | null;
+  avatar_url?: string | null;
   created_at: string;
   updated_at: string;
 }

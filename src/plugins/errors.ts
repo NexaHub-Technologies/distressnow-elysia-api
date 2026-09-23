@@ -36,6 +36,7 @@ export const conflict = (message: string) => new HttpError(409, message);
  * - Anything else                -> 500 (message hidden in production)
  */
 export const errorsPlugin = new Elysia({ name: "errors" }).onError(
+  { as: "global" },
   ({ code, error, set }) => {
     if (error instanceof HttpError) {
       set.status = error.status;

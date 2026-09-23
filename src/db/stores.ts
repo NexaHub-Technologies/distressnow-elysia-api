@@ -123,6 +123,8 @@ function rowToAuthUser(
     location_sublocation: row.locationSublocation,
     interests: (row.interests as string[] | null) ?? null,
     onboarding_completed: row.onboardingCompleted,
+    notification_settings: (row.notificationSettings as Record<string, boolean> | null) ?? null,
+    avatar_url: row.avatarPath ? `/uploads/${row.avatarPath}` : null,
     created_at: toIso(row.createdAt) ?? nowIso(),
     updated_at: toIso(row.updatedAt) ?? nowIso(),
   };
@@ -259,6 +261,9 @@ export function createDbUserStore(): UserStore {
         set.authProvider = patch.auth_provider as typeof users.$inferInsert.authProvider;
       }
       if ("provider_id" in patch) set.providerId = patch.provider_id;
+      if ("notification_settings" in patch) {
+        set.notificationSettings = patch.notification_settings as never;
+      }
 
       if (Object.keys(set).length === 0) return lookupById(numeric);
 

@@ -185,6 +185,10 @@ export const users = pgTable(
     typingInConversation: varchar("typing_in_conversation", { length: 191 }),
     typingAt: timestamp("typing_at", { withTimezone: true }),
     rememberToken: varchar("remember_token", { length: 100 }),
+    profileViewsCount: bigint("profile_views_count", { mode: "number" })
+      .default(0)
+      .notNull(),
+    notificationSettings: jsonb("notification_settings"),
     ...timestamps,
   },
   (t) => [index("users_last_seen_at_idx").on(t.lastSeenAt)],
@@ -655,6 +659,11 @@ export const stores = pgTable(
     reviewCount: integer("review_count").default(0).notNull(),
     listingsCount: integer("listings_count").default(0).notNull(),
     followersCount: integer("followers_count").default(0).notNull(),
+    viewsCount: bigint("views_count", { mode: "number" }).default(0).notNull(),
+    isPromoted: boolean("is_promoted").default(false).notNull(),
+    promotionType: varchar("promotion_type", { length: 50 }),
+    promotedAt: timestamp("promoted_at", { withTimezone: true }),
+    promotionExpiry: timestamp("promotion_expiry", { withTimezone: true }),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
     lastActiveAt: timestamp("last_active_at", { withTimezone: true }),
     ...timestamps,
@@ -722,6 +731,7 @@ export const serviceProviders = pgTable(
     totalReviews: integer("total_reviews").default(0).notNull(),
     completedJobs: integer("completed_jobs").default(0).notNull(),
     totalServices: integer("total_services").default(0).notNull(),
+    viewsCount: bigint("views_count", { mode: "number" }).default(0).notNull(),
     ...timestamps,
   },
   (t) => [
@@ -1043,15 +1053,19 @@ export const adverts = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     /** Listing uuid (no FK — mirrors foreignUuid without constraint). */
     listingId: uuid("listing_id"),
+    storeId: uuid("store_id"),
     title: text("title").notNull(),
     description: text("description"),
     imagePath: text("image_path"),
     targetUrl: text("target_url"),
+    placement: varchar("placement", { length: 50 }).default("banner").notNull(),
+    packageId: varchar("package_id", { length: 50 }),
     durationDays: integer("duration_days").default(7).notNull(),
     status: varchar("status", { length: 20 }).default("pending").notNull(),
     amountPaid: decimal("amount_paid", { precision: 10, scale: 2 })
       .default("0")
       .notNull(),
+    paymentReference: varchar("payment_reference", { length: 100 }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     ...timestamps,
@@ -1116,3 +1130,173 @@ export const safetyReports = pgTable(
     index("safety_reports_reporter_idx").on(t.reporterId),
   ],
 );
+
+// ─── store_views & profile_views ──────────────────────────────────────────
+
+export const storeViews = pgTable(
+  "store_views",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    storeId: bigint("store_id", { mode: "number" })
+      .notNull()
+      .references(() => stores.id, { onDelete: "cascade" }),
+    viewerId: bigint("viewer_id", { mode: "number" }).references(() => users.id, {
+      onDelete: "set null",
+    }),
+    ipAddress: varchar("ip_address", { length: 45 }),
+    userAgent: text("user_agent"),
+    viewedAt: timestamp("viewed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("store_views_store_viewed_idx").on(t.storeId, t.viewedAt),
+    index("store_views_viewer_viewed_idx").on(t.viewerId, t.viewedAt),
+  ],
+);
+
+export const profileViews = pgTable(
+  "profile_views",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    viewerId: bigint("viewer_id", { mode: "number" }).references(() => users.id, {
+      onDelete: "set null",
+    }),
+    ipAddress: varchar("ip_address", { length: 45 }),
+    userAgent: text("user_agent"),
+    viewedAt: timestamp("viewed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("profile_views_user_viewed_idx").on(t.userId, t.viewedAt),
+    index("profile_views_viewer_viewed_idx").on(t.viewerId, t.viewedAt),
+  ],
+);
+
+export const serviceProviderViews = pgTable(
+  "service_provider_views",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    serviceProviderId: bigint("service_provider_id", { mode: "number" })
+      .notNull()
+      .references(() => serviceProviders.id, { onDelete: "cascade" }),
+    viewerId: bigint("viewer_id", { mode: "number" }).references(() => users.id, {
+      onDelete: "set null",
+    }),
+    ipAddress: varchar("ip_address", { length: 45 }),
+    userAgent: text("user_agent"),
+    viewedAt: timestamp("viewed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("service_provider_views_provider_viewed_idx").on(
+      t.serviceProviderId,
+      t.viewedAt,
+    ),
+    index("service_provider_views_viewer_viewed_idx").on(
+      t.viewerId,
+      t.viewedAt,
+    ),
+  ],
+);
+
+// ─── item_requests & item_request_responses ────────────────────────────────
+
+export const itemRequests = pgTable(
+  "item_requests",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    uuid: uuid("uuid").notNull().unique().defaultRandom(),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    title: varchar("title", { length: 255 }).notNull(),
+    description: text("description").notNull(),
+    categoryId: bigint("category_id", { mode: "number" }).references(
+      () => categories.id,
+      { onDelete: "set null" },
+    ),
+    subcategoryId: bigint("subcategory_id", { mode: "number" }).references(
+      () => subcategories.id,
+      { onDelete: "set null" },
+    ),
+    stateId: bigint("state_id", { mode: "number" }).references(
+      () => states.id,
+      { onDelete: "set null" },
+    ),
+    sublocationId: bigint("sublocation_id", { mode: "number" }).references(
+      () => sublocations.id,
+      { onDelete: "set null" },
+    ),
+    budgetMin: decimal("budget_min", { precision: 12, scale: 2 }),
+    budgetMax: decimal("budget_max", { precision: 12, scale: 2 }),
+    images: jsonb("images"),
+    status: varchar("status", { length: 32 }).default("open").notNull(),
+    responsesCount: integer("responses_count").default(0).notNull(),
+    broadcastCount: integer("broadcast_count").default(0).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [
+    index("item_requests_status_idx").on(t.status),
+    index("item_requests_created_at_idx").on(t.createdAt),
+    index("item_requests_state_status_idx").on(t.stateId, t.status),
+    index("item_requests_category_status_idx").on(t.categoryId, t.status),
+  ],
+);
+
+export const itemRequestResponses = pgTable(
+  "item_request_responses",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    uuid: uuid("uuid").notNull().unique().defaultRandom(),
+    itemRequestId: bigint("item_request_id", { mode: "number" })
+      .notNull()
+      .references(() => itemRequests.id, { onDelete: "cascade" }),
+    storeId: bigint("store_id", { mode: "number" })
+      .notNull()
+      .references(() => stores.id, { onDelete: "cascade" }),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    price: decimal("price", { precision: 12, scale: 2 }).notNull(),
+    message: text("message").notNull(),
+    listingId: bigint("listing_id", { mode: "number" }).references(
+      () => listings.id,
+      { onDelete: "set null" },
+    ),
+    images: jsonb("images"),
+    status: varchar("status", { length: 32 }).default("pending").notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    unique("req_store_response_unique").on(t.itemRequestId, t.storeId),
+    index("item_request_responses_user_idx").on(t.userId),
+    index("item_request_responses_store_idx").on(t.storeId),
+    index("item_request_responses_status_idx").on(t.status),
+    index("item_request_responses_created_at_idx").on(t.createdAt),
+  ],
+);
+
+// ─── system_settings ───────────────────────────────────────────────────────
+
+export const systemSettings = pgTable(
+  "system_settings",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    key: varchar("key", { length: 255 }).notNull().unique(),
+    value: text("value"),
+    group: varchar("group", { length: 100 }).default("general").notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    index("system_settings_key_idx").on(t.key),
+    index("system_settings_group_idx").on(t.group),
+  ],
+);
+

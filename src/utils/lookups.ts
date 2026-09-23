@@ -102,6 +102,8 @@ export async function resolveCategoryIdStrict(
   return resolveRef(categories, ref);
 }
 
+export const resolveCategoryId = resolveCategoryIdStrict;
+
 export async function resolveSubcategoryId(
   ref: string | undefined,
 ): Promise<number | null | undefined> {

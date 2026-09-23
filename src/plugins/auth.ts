@@ -40,13 +40,20 @@ export const auth = new Elysia({ name: "auth" })
       const header = headers["authorization"];
       if (!header || !header.startsWith("Bearer ")) return none;
 
-      const payload = (await jwt.verify(header.slice(7))) as unknown as Partial<JwtPayload> | null;
-      if (!payload || typeof payload.sub !== "number") return none;
+      const payload = (await jwt.verify(header.slice(7))) as unknown as { sub?: unknown; roles?: unknown } | null;
+      if (!payload) return none;
+      const subNum =
+        typeof payload.sub === "number"
+          ? payload.sub
+          : typeof payload.sub === "string" && /^\d+$/.test(payload.sub)
+            ? Number(payload.sub)
+            : null;
+      if (subNum === null) return none;
 
       const rows = await db
         .select()
         .from(users)
-        .where(eq(users.id, payload.sub))
+        .where(eq(users.id, subNum))
         .limit(1);
       const user = rows[0];
       if (!user) return none;

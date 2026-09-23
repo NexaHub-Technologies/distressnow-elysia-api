@@ -457,3 +457,97 @@ describe("notification broadcasts", () => {
     expect(((listed.data.data as Record<string, unknown>).broadcasts as unknown[]).length).toBe(1);
   });
 });
+
+describe("admin store review queue", () => {
+  test("lists pending stores and allows approval and decline", async () => {
+    store.stores.set("store-1", {
+      id: "store-1",
+      uuid: "11111111-1111-1111-1111-111111111111",
+      userId: "10",
+      name: "Gadget Hub",
+      slug: "gadget-hub",
+      description: null,
+      logoPath: null,
+      bannerPath: null,
+      phone: null,
+      email: null,
+      status: "pending",
+      isVerified: false,
+      verifiedAt: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+
+    const listRes = await handle(app, json("GET", "/api/v1/admin/stores?status=pending", undefined, ADMIN));
+    expect(listRes.status).toBe(200);
+    const storesList = listRes.data.data as Array<Record<string, unknown>>;
+    expect(storesList.length).toBe(1);
+    expect(storesList[0]?.name).toBe("Gadget Hub");
+
+    const approveRes = await handle(app, json("POST", "/api/v1/admin/stores/store-1/approve", undefined, ADMIN));
+    expect(approveRes.status).toBe(200);
+    expect(store.stores.get("store-1")?.status).toBe("active");
+    expect(store.stores.get("store-1")?.isVerified).toBe(true);
+
+    const declineRes = await handle(app, json("POST", "/api/v1/admin/stores/store-1/decline", { reason: "Invalid business address" }, ADMIN));
+    expect(declineRes.status).toBe(200);
+    expect(store.stores.get("store-1")?.status).toBe("declined");
+  });
+});
+
+describe("admin safety reports queue", () => {
+  test("lists safety reports and resolves them", async () => {
+    store.safetyReports.set("report-1", {
+      id: "report-1",
+      uuid: "22222222-2222-2222-2222-222222222222",
+      reporterId: "10",
+      reportType: "listing",
+      message: "Suspected fake item listing",
+      listingId: "55",
+      reportedUserId: null,
+      status: "pending",
+      reviewedBy: null,
+      reviewedAt: null,
+      action: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+
+    const listRes = await handle(app, json("GET", "/api/v1/admin/safety-reports?status=pending", undefined, ADMIN));
+    expect(listRes.status).toBe(200);
+    const reports = listRes.data.data as Array<Record<string, unknown>>;
+    expect(reports.length).toBe(1);
+
+    const resolveRes = await handle(app, json("POST", "/api/v1/admin/safety-reports/report-1/resolve", {
+      status: "resolved",
+      action: "listing_removed",
+    }, ADMIN));
+    expect(resolveRes.status).toBe(200);
+    expect(store.safetyReports.get("report-1")?.status).toBe("resolved");
+    expect(store.safetyReports.get("report-1")?.action).toBe("listing_removed");
+  });
+});
+
+describe("admin SMS settings", () => {
+  test("gets and updates sms configuration", async () => {
+    const getRes = await handle(app, json("GET", "/api/v1/admin/settings/sms", undefined, ADMIN));
+    expect(getRes.status).toBe(200);
+    const settings = getRes.data.data as Record<string, unknown>;
+    expect(settings.active_provider).toBeDefined();
+
+    const putRes = await handle(app, json("PUT", "/api/v1/admin/settings/sms", {
+      provider: "termii",
+      termii_api_key: "test_termii_key_123",
+      termii_sender_id: "DistressNow",
+    }, ADMIN));
+    expect(putRes.status).toBe(200);
+    expect(store.systemSettings.get("sms_provider")).toBe("termii");
+    expect(store.systemSettings.get("termii_api_key")).toBe("test_termii_key_123");
+
+    const testRes = await handle(app, json("POST", "/api/v1/admin/settings/sms/test", {
+      phone: "+2348012345678",
+      message: "Test SMS",
+    }, ADMIN));
+    expect(testRes.status).toBe(200);
+  });
+});

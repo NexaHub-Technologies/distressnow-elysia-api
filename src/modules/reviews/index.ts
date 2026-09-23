@@ -1,62 +1,181 @@
 /**
  * Reviews module.
  *
- * - GET  /reviews?target_type=store|provider|listing&target_id=<uuid>
+ * - GET  /reviews?target_type=store|provider|listing|seller|user&target_id=<id>
  *        (Laravel aliases reviewable_type/reviewable_id and type/id also
  *        accepted). Public. Includes an average/total summary in meta.
  * - POST /reviews { target_type, target_id, rating 1-5, comment? }
  *        (auth; duplicate per user+target -> 409; aggregates updated for
- *        stores/providers).
+ *        stores/providers; review_received notification sent).
  */
 import { Elysia, t } from "elysia";
-import { and, count, desc, eq, sql } from "drizzle-orm";
+import { and, count, desc, eq, or, sql } from "drizzle-orm";
 import { db } from "../../db/client";
 import { listings, reviews, serviceProviders, stores, users } from "../../db/schema";
 import { auth } from "../../plugins/auth";
 import { fail, ok, paginated } from "../../utils/response";
 import { buildMeta, parsePagination } from "../../utils/pagination";
 import {
-  isReviewTarget,
   num,
   validateRating,
   type ReviewTarget,
 } from "../../utils/marketplace";
+import { notificationStore } from "../notifications/index";
+
+export const EXTENDED_REVIEW_TARGETS = [
+  "store",
+  "provider",
+  "listing",
+  "seller",
+  "user",
+] as const;
+
+export function isValidReviewTarget(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    (EXTENDED_REVIEW_TARGETS as readonly string[]).includes(
+      value.toLowerCase().trim(),
+    )
+  );
+}
 
 // Re-exported so tests (and clients) can reach the rule via this module.
 export { validateRating };
 
 interface ReviewTargetRow {
-  kind: "store" | "provider" | "listing";
+  kind: "store" | "provider" | "listing" | "user";
   id: number;
   uuid: string;
   ownerId: number;
 }
 
 async function resolveTarget(
-  targetType: ReviewTarget,
-  targetUuid: string,
+  targetTypeRaw: string,
+  targetId: string,
 ): Promise<ReviewTargetRow | null> {
-  if (targetType === "store") {
-    const rows = await db.select().from(stores).where(eq(stores.uuid, targetUuid)).limit(1);
-    const store = rows[0];
-    return store ? { kind: "store", id: store.id, uuid: store.uuid, ownerId: store.userId } : null;
-  }
-  if (targetType === "provider") {
-    const rows = await db
-      .select()
-      .from(serviceProviders)
-      .where(eq(serviceProviders.uuid, targetUuid))
-      .limit(1);
-    const provider = rows[0];
-    return provider
-      ? { kind: "provider", id: provider.id, uuid: provider.uuid, ownerId: provider.userId }
+  const type = targetTypeRaw.toLowerCase().trim();
+  const id = targetId.trim();
+  const isNumeric = /^\d+$/.test(id);
+  const isUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+  if (type === "store") {
+    let store: typeof stores.$inferSelect | undefined;
+    if (isUuid) {
+      const rows = await db
+        .select()
+        .from(stores)
+        .where(eq(stores.uuid, id))
+        .limit(1);
+      store = rows[0];
+    } else if (isNumeric) {
+      const intId = Number(id);
+      const rows = await db
+        .select()
+        .from(stores)
+        .where(or(eq(stores.id, intId), eq(stores.userId, intId)))
+        .limit(1);
+      store = rows[0];
+    } else {
+      const rows = await db
+        .select()
+        .from(stores)
+        .where(eq(stores.slug, id))
+        .limit(1);
+      store = rows[0];
+    }
+    return store
+      ? { kind: "store", id: store.id, uuid: store.uuid, ownerId: store.userId }
       : null;
   }
-  const rows = await db.select().from(listings).where(eq(listings.uuid, targetUuid)).limit(1);
-  const listing = rows[0];
-  return listing
-    ? { kind: "listing", id: listing.id, uuid: listing.uuid, ownerId: listing.userId }
-    : null;
+
+  if (type === "provider") {
+    let provider: typeof serviceProviders.$inferSelect | undefined;
+    if (isUuid) {
+      const rows = await db
+        .select()
+        .from(serviceProviders)
+        .where(eq(serviceProviders.uuid, id))
+        .limit(1);
+      provider = rows[0];
+    } else if (isNumeric) {
+      const intId = Number(id);
+      const rows = await db
+        .select()
+        .from(serviceProviders)
+        .where(
+          or(eq(serviceProviders.id, intId), eq(serviceProviders.userId, intId)),
+        )
+        .limit(1);
+      provider = rows[0];
+    } else {
+      const rows = await db
+        .select()
+        .from(serviceProviders)
+        .where(eq(serviceProviders.slug, id))
+        .limit(1);
+      provider = rows[0];
+    }
+    return provider
+      ? {
+          kind: "provider",
+          id: provider.id,
+          uuid: provider.uuid,
+          ownerId: provider.userId,
+        }
+      : null;
+  }
+
+  if (type === "listing") {
+    let listing: typeof listings.$inferSelect | undefined;
+    if (isUuid) {
+      const rows = await db
+        .select()
+        .from(listings)
+        .where(eq(listings.uuid, id))
+        .limit(1);
+      listing = rows[0];
+    } else if (isNumeric) {
+      const rows = await db
+        .select()
+        .from(listings)
+        .where(eq(listings.id, Number(id)))
+        .limit(1);
+      listing = rows[0];
+    }
+    return listing
+      ? {
+          kind: "listing",
+          id: listing.id,
+          uuid: listing.uuid,
+          ownerId: listing.userId,
+        }
+      : null;
+  }
+
+  if (type === "seller" || type === "user") {
+    let user: typeof users.$inferSelect | undefined;
+    if (isNumeric) {
+      const rows = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, Number(id)))
+        .limit(1);
+      user = rows[0];
+    } else if (id.includes("@")) {
+      const rows = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, id))
+        .limit(1);
+      user = rows[0];
+    }
+    return user
+      ? { kind: "user", id: user.id, uuid: String(user.id), ownerId: user.id }
+      : null;
+  }
+
+  return null;
 }
 
 async function updateAggregateRating(kind: "store" | "provider", id: number) {
@@ -90,9 +209,11 @@ export const reviewsModule = new Elysia()
       const targetTypeRaw =
         query.target_type ?? query.reviewable_type ?? query.type;
       const targetId = query.target_id ?? query.reviewable_id ?? query.id;
-      if (!targetTypeRaw || !targetId || !isReviewTarget(targetTypeRaw)) {
+      if (!targetTypeRaw || !targetId || !isValidReviewTarget(targetTypeRaw)) {
         set.status = 422;
-        return fail("target_type (store|provider|listing) and target_id are required.");
+        return fail(
+          "target_type (store|provider|listing|seller|user) and target_id are required.",
+        );
       }
       const target = await resolveTarget(targetTypeRaw, targetId);
       if (!target) {
@@ -105,7 +226,13 @@ export const reviewsModule = new Elysia()
         eq(reviews.reviewableId, target.id),
       );
       const [rows, totalRows, summaryRows] = await Promise.all([
-        db.select().from(reviews).where(where).orderBy(desc(reviews.createdAt)).limit(perPage).offset(offset),
+        db
+          .select()
+          .from(reviews)
+          .where(where)
+          .orderBy(desc(reviews.createdAt))
+          .limit(perPage)
+          .offset(offset),
         db.select({ total: count() }).from(reviews).where(where),
         db
           .select({ avg: sql<string | null>`AVG(${reviews.rating})`, total: count() })
@@ -161,15 +288,29 @@ export const reviewsModule = new Elysia()
         set.status = 401;
         return fail("Unauthenticated.");
       }
-      if (!isReviewTarget(body.target_type)) {
+      const rawBody = body as Record<string, any>;
+      const targetTypeRaw = (
+        rawBody.target_type ??
+        rawBody.reviewable_type ??
+        rawBody.type ??
+        ""
+      )
+        .toLowerCase()
+        .trim();
+      const targetId = String(
+        rawBody.target_id ?? rawBody.reviewable_id ?? rawBody.id ?? "",
+      ).trim();
+
+      if (!targetTypeRaw || !targetId || !isValidReviewTarget(targetTypeRaw)) {
         set.status = 422;
-        return fail("target_type must be store, provider or listing.");
+        return fail("target_type must be store, provider, listing, seller or user.");
       }
-      if (!validateRating(body.rating)) {
+      const rating = Number(rawBody.rating);
+      if (!validateRating(rating)) {
         set.status = 422;
         return fail("Rating must be an integer between 1 and 5.");
       }
-      const target = await resolveTarget(body.target_type, body.target_id);
+      const target = await resolveTarget(targetTypeRaw, targetId);
       if (!target) {
         set.status = 404;
         return fail("Review target not found.");
@@ -187,7 +328,7 @@ export const reviewsModule = new Elysia()
         .limit(1);
       if (existing[0]) {
         set.status = 409;
-        return fail(`You have already reviewed this ${target.kind}.`);
+        return fail(`You have already reviewed this ${targetTypeRaw}.`);
       }
       const inserted = await db
         .insert(reviews)
@@ -195,8 +336,8 @@ export const reviewsModule = new Elysia()
           userId: currentUser.id,
           reviewableType: target.kind,
           reviewableId: target.id,
-          rating: body.rating,
-          comment: body.comment ?? null,
+          rating,
+          comment: rawBody.comment ?? null,
         })
         .returning();
       const review = inserted[0];
@@ -207,13 +348,32 @@ export const reviewsModule = new Elysia()
       if (target.kind === "store" || target.kind === "provider") {
         await updateAggregateRating(target.kind, target.id);
       }
+      if (target.ownerId && target.ownerId !== currentUser.id) {
+        notificationStore.create({
+          userId: String(target.ownerId),
+          type: "review_received",
+          title: "New review received",
+          body: `${currentUser.name} left you a ${rating}-star review.`,
+          data: {
+            review_id: review.id,
+            reviewable_type: targetTypeRaw,
+            reviewable_uuid: target.uuid,
+            rating,
+          },
+        });
+      }
       set.status = 201;
       return ok(review, "Review submitted successfully.");
     },
     {
       body: t.Object({
-        target_type: t.String(),
-        target_id: t.String({ format: "uuid" }),
+        target_type: t.Optional(t.String()),
+        target_id: t.Optional(t.String()),
+        reviewable_type: t.Optional(t.String()),
+        reviewable_id: t.Optional(t.String()),
+        type: t.Optional(t.String()),
+        id: t.Optional(t.String()),
+        booking_id: t.Optional(t.Union([t.String(), t.Number()])),
         rating: t.Integer(),
         comment: t.Optional(t.String({ maxLength: 2000 })),
       }),

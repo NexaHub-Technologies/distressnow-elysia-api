@@ -52,6 +52,7 @@ function serializeProvider(provider: ProviderRow, rel: ProviderRelations) {
     rating: num(provider.rating),
     total_reviews: provider.totalReviews,
     completed_jobs: provider.completedJobs,
+    views_count: provider.viewsCount ? Number(provider.viewsCount) : 0,
     state: provider.stateId ? (rel.states.get(provider.stateId) ?? null) : null,
     sublocation: provider.sublocationId
       ? (rel.sublocations.get(provider.sublocationId) ?? null)
